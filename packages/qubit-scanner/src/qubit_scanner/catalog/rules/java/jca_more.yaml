@@ -1,0 +1,281 @@
+schema: qubit-rule/v1
+language: java
+library:
+  name: Java JCA/JCE
+  detect_imports: [java, javax]
+rules:
+  # Gaps in the original java/jca.yaml pack: it covered only the broken primitives (DES, 3DES,
+  # SHA-1, RSA), so AES — overwhelmingly the most common cipher in Java code — produced no finding,
+  # and neither did EC/DSA key generation, MACs, or the strong hashes CNSA 2.0 requires evidence of.
+  - id: JAVA-JCA-CIPHER-AES
+    title: Cipher.getInstance("AES/...")
+    match:
+      query: |
+        (method_invocation
+          object: (identifier) @obj
+          name: (identifier) @meth
+          arguments: (argument_list (string_literal) @algo)) @call
+      where:
+        - { capture: obj, equals: Cipher }
+        - { capture: meth, equals: getInstance }
+        - { capture: algo, regex: '^"AES(/|")' }
+    extract:
+      # The transformation string is "AES/CBC/PKCS5Padding"; the registry resolves the leading
+      # family and the mode/padding are evidence, not security-relevant to the quantum verdict.
+      algorithm: { literal: AES }
+      mode:
+        from: call
+        resolve: cipher-mode
+    asset: { asset_type: algorithm-use, usage_context: encryption-at-rest }
+    confidence: high
+    examples:
+      positive:
+        - |
+          import javax.crypto.Cipher;
+          class A { void f() throws Exception { Cipher.getInstance("AES/GCM/NoPadding"); } }
+        - |
+          import javax.crypto.Cipher;
+          class A { void f() throws Exception { Cipher.getInstance("AES"); } }
+      negative:
+        - |
+          import javax.crypto.Cipher;
+          class A { void f() throws Exception { Cipher.getInstance("DES/ECB/PKCS5Padding"); } }
+
+  - id: JAVA-JCA-MESSAGEDIGEST-STRONG
+    title: MessageDigest.getInstance("SHA-256"/"SHA-384"/"SHA-512") — inventoried
+    match:
+      query: |
+        (method_invocation
+          object: (identifier) @obj
+          name: (identifier) @meth
+          arguments: (argument_list (string_literal) @algo)) @call
+      where:
+        - { capture: obj, equals: MessageDigest }
+        - { capture: meth, equals: getInstance }
+        - { capture: algo, regex: '^"SHA-?(256|384|512)"$' }
+    extract:
+      algorithm: { from: algo, resolve: string-literal }
+    asset: { asset_type: algorithm-use, usage_context: hash }
+    confidence: high
+    examples:
+      positive:
+        - |
+          import java.security.MessageDigest;
+          class A { void f() throws Exception { MessageDigest.getInstance("SHA-384"); } }
+        - |
+          import java.security.MessageDigest;
+          class A { void f() throws Exception { MessageDigest.getInstance("SHA-256"); } }
+      negative:
+        - |
+          import java.security.MessageDigest;
+          class A { void f() throws Exception { MessageDigest.getInstance("MD5"); } }
+
+  - id: JAVA-JCA-KEYPAIRGEN-EC
+    title: KeyPairGenerator.getInstance("EC"/"ECDSA")
+    match:
+      query: |
+        (method_invocation
+          object: (identifier) @obj
+          name: (identifier) @meth
+          arguments: (argument_list (string_literal) @algo)) @call
+      where:
+        - { capture: obj, equals: KeyPairGenerator }
+        - { capture: meth, equals: getInstance }
+        - { capture: algo, regex: '^"(EC|ECDSA)"$' }
+    extract:
+      algorithm: { from: algo, resolve: string-literal }
+    asset: { asset_type: algorithm-use, usage_context: signature }
+    confidence: high
+    examples:
+      positive:
+        - |
+          import java.security.KeyPairGenerator;
+          class A { void f() throws Exception { KeyPairGenerator.getInstance("EC"); } }
+      negative:
+        - |
+          import java.security.KeyPairGenerator;
+          class A { void f() throws Exception { KeyPairGenerator.getInstance("RSA"); } }
+
+  - id: JAVA-JCA-KEYPAIRGEN-DSA
+    title: KeyPairGenerator.getInstance("DSA")
+    match:
+      query: |
+        (method_invocation
+          object: (identifier) @obj
+          name: (identifier) @meth
+          arguments: (argument_list (string_literal) @algo)) @call
+      where:
+        - { capture: obj, equals: KeyPairGenerator }
+        - { capture: meth, equals: getInstance }
+        - { capture: algo, equals: '"DSA"' }
+    extract:
+      algorithm: { literal: DSA }
+    asset: { asset_type: algorithm-use, usage_context: signature }
+    confidence: high
+    examples:
+      positive:
+        - |
+          import java.security.KeyPairGenerator;
+          class A { void f() throws Exception { KeyPairGenerator.getInstance("DSA"); } }
+      negative:
+        - |
+          import java.security.KeyPairGenerator;
+          class A { void f() throws Exception { KeyPairGenerator.getInstance("EC"); } }
+
+  - id: JAVA-JCA-MAC
+    title: Mac.getInstance("Hmac...")
+    match:
+      query: |
+        (method_invocation
+          object: (identifier) @obj
+          name: (identifier) @meth
+          arguments: (argument_list (string_literal) @algo)) @call
+      where:
+        - { capture: obj, equals: Mac }
+        - { capture: meth, equals: getInstance }
+        - { capture: algo, regex: '^"Hmac' }
+    extract:
+      # `@algo` is already the full "HmacSHA256"-style literal, so the digest name is right there
+      # — see python/cryptography_more.yaml's PY-HMAC-NEW for why this must not be `{literal: HMAC}`.
+      algorithm: { from: algo, resolve: hmac-digest }
+    asset: { asset_type: algorithm-use, usage_context: token }
+    confidence: high
+    examples:
+      positive:
+        - |
+          import javax.crypto.Mac;
+          class A { void f() throws Exception { Mac.getInstance("HmacSHA256"); } }
+      negative:
+        - |
+          import java.security.MessageDigest;
+          class A { void f() throws Exception { MessageDigest.getInstance("SHA-256"); } }
+
+  - id: JAVA-JCA-SECRETKEYFACTORY-PBKDF2
+    title: SecretKeyFactory.getInstance("PBKDF2...")
+    match:
+      query: |
+        (method_invocation
+          object: (identifier) @obj
+          name: (identifier) @meth
+          arguments: (argument_list (string_literal) @algo)) @call
+      where:
+        - { capture: obj, equals: SecretKeyFactory }
+        - { capture: meth, equals: getInstance }
+        - { capture: algo, regex: '^"PBKDF2' }
+    extract:
+      algorithm: { literal: PBKDF2 }
+      prf:
+        from: call
+        resolve: kdf-prf
+    asset: { asset_type: algorithm-use, usage_context: password }
+    confidence: high
+    examples:
+      positive:
+        - |
+          import javax.crypto.SecretKeyFactory;
+          class A { void f() throws Exception { SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256"); } }
+      negative:
+        - |
+          import javax.crypto.Cipher;
+          class A { void f() throws Exception { Cipher.getInstance("AES/GCM/NoPadding"); } }
+
+  # ── Generic getInstance, for algorithms the call site does not spell out ──────────────────────
+  # Every Cipher/MessageDigest rule above constrains the argument with a regex on the literal text,
+  # which is precise and cannot, by construction, match `Cipher.getInstance(crypto)`. Measured on
+  # CryptoAPI-Bench, that is not a corner case: recall on its interprocedural, field-sensitive,
+  # multi-method and multi-class cases was **zero**, while the identical misuse written with a
+  # literal was found every time. These two rules take the argument as either a literal or a name
+  # and let `_string_value` fold a single intra-file assignment, so `String crypto = "DES/ECB/..."`
+  # followed by `Cipher.getInstance(crypto)` resolves to DES.
+  #
+  # They are deliberately LAST in specificity: `_one_per_site` prefers the rule with more `where`
+  # clauses, so a literal call still reports through the precise rule that carries the migration
+  # example, and these only supply the sites those cannot reach.
+  - id: JAVA-JCA-CIPHER
+    title: Cipher.getInstance(<transformation>) — literal or folded constant
+    match:
+      query: |
+        (method_invocation
+          object: (identifier) @obj
+          name: (identifier) @meth
+          arguments: (argument_list . [(string_literal) (identifier)] @algo)) @call
+      where:
+        - { capture: obj, equals: Cipher }
+        - { capture: meth, equals: getInstance }
+    extract:
+      algorithm: { from: algo, resolve: jca-transformation }
+      mode:
+        from: call
+        resolve: cipher-mode
+      padding:
+        from: call
+        resolve: padding-scheme
+    asset: { asset_type: algorithm-use, usage_context: encryption-at-rest }
+    confidence: medium
+    examples:
+      positive:
+        - |
+          import javax.crypto.Cipher;
+          class A { void f() throws Exception { String c = "DES/ECB/PKCS5Padding"; Cipher.getInstance(c); } }
+        - |
+          import javax.crypto.Cipher;
+          class A { void f() throws Exception { Cipher.getInstance("AES/GCM/NoPadding"); } }
+      negative:
+        - |
+          import javax.crypto.Mac;
+          class A { void f() throws Exception { Mac.getInstance("HmacSHA256"); } }
+
+  - id: JAVA-JCA-MESSAGEDIGEST
+    title: MessageDigest.getInstance(<alg>) — literal or folded constant
+    match:
+      query: |
+        (method_invocation
+          object: (identifier) @obj
+          name: (identifier) @meth
+          arguments: (argument_list . [(string_literal) (identifier)] @algo)) @call
+      where:
+        - { capture: obj, equals: MessageDigest }
+        - { capture: meth, equals: getInstance }
+    extract:
+      algorithm: { from: algo, resolve: string-constant }
+    asset: { asset_type: algorithm-use, usage_context: hash }
+    confidence: medium
+    examples:
+      positive:
+        - |
+          import java.security.MessageDigest;
+          class A { void f() throws Exception { String h = "MD4"; MessageDigest.getInstance(h); } }
+        - |
+          import java.security.MessageDigest;
+          class A { void f() throws Exception { MessageDigest.getInstance("MD2"); } }
+      negative:
+        - |
+          import javax.crypto.Cipher;
+          class A { void f() throws Exception { Cipher.getInstance("AES/GCM/NoPadding"); } }
+
+  # The PBKDF2 *parameters* live at a different call site from the PBKDF2 *algorithm*:
+  # `SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1")` names the PRF, `new PBEKeySpec(pw, salt,
+  # 1000, 128)` decides whether it is usable. Only the second one can say the work factor is a
+  # 1990s number, which is why it needs a rule of its own rather than an extractor on the first.
+  - id: JAVA-JCA-PBEKEYSPEC
+    title: new PBEKeySpec(password, salt, iterations, keyLength)
+    match:
+      query: |
+        (object_creation_expression type: (type_identifier) @cls) @call
+      where:
+        - { capture: cls, in: [PBEKeySpec] }
+    extract:
+      algorithm: { literal: PBKDF2 }
+      iterations:
+        from: call
+        resolve: kdf-iterations
+    asset: { asset_type: algorithm-use, usage_context: password }
+    confidence: high
+    examples:
+      positive:
+        - |
+          import javax.crypto.spec.PBEKeySpec;
+          class A { void f() { PBEKeySpec s = new PBEKeySpec(pw, salt, 1000, 128); } }
+      negative:
+        - |
+          class A { void f() { SecretKeySpec s = new SecretKeySpec(key, "AES"); } }

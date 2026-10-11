@@ -1,0 +1,910 @@
+"""Project scoping: the overview rollup, and migration plans belonging to a project.
+
+These pin the behaviour behind a specific reported failure: *after a scan, the migration for the
+project isn't showing up*. Three separate causes sat behind it, and each gets a test here.
+
+1. ``MigrationOrchestrator.build_plan`` had no scope at all — it selected every vulnerable,
+   risk-scored asset in the database, across every project and every historical scan. On the
+   development machine that meant one 18-task plan assembled from eight unrelated projects.
+2. ``MigrationPlan`` had nowhere to record what it was built from (``scope_json`` was ``{}`` on all
+   24 plans in the real database), so ``GET /migrate/plans`` could not be filtered and the app took
+   whichever plan was newest — belonging to whatever had been scanned last.
+3. Nothing built a plan when a scan finished, so a freshly scanned project had none of its own even
+   once scoping worked.
+
+The fourth piece is ``GET /projects/overview``: the app needs per-project counts to draw a
+project-wise landing on every tab, and computing them by fetching every asset into the browser is
+what the merged view was doing instead.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import pytest
+from fastapi.testclient import TestClient
+from qubit_api.app import create_app
+from qubit_api.settings import Settings
+
+# Two small source trees with genuinely different cryptography, so a plan built for one can be shown
+# not to contain the other's assets.
+PROJECT_A_SOURCE = """
+import hashlib
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+
+def fingerprint(payload: bytes) -> str:
+    return hashlib.md5(payload).hexdigest()
+
+
+def issue_key():
+    return rsa.generate_private_key(public_exponent=65537, key_size=1024)
+"""
+
+PROJECT_B_SOURCE = """
+import hashlib
+
+
+def marker(payload: bytes) -> str:
+    return hashlib.sha1(payload).hexdigest()
+"""
+
+
+@pytest.fixture
+def client(tmp_path: Path) -> Any:
+    settings = Settings(
+        db_url=f"sqlite:///{(tmp_path / 'scoping.db').as_posix()}",
+        create_schema_on_startup=True,
+    )
+    with TestClient(
+        create_app(settings), headers={"Authorization": f"Bearer {settings.api_token}"}
+    ) as c:
+        yield c
+
+
+def _await_scan(client: TestClient, scan_id: str) -> None:
+    """Wait for a scan to leave queued/running.
+
+    The app under test has a job runner, so a scan is dispatched off the request path and the POST
+    response reports "running" with no assets yet. The plan is built at the *end* of that job, so a
+    test that asserted on plans immediately after the POST would be racing the thing it is testing.
+    """
+    for _ in range(300):
+        status = client.get(f"/api/v1/scans/{scan_id}").json()["status"]
+        if status not in ("queued", "running"):
+            assert status == "succeeded", f"seed scan failed: {status}"
+            return
+        time.sleep(0.1)
+    raise TimeoutError(f"scan {scan_id} did not finish")
+
+
+def _scan(client: TestClient, name: str, target: Path) -> tuple[str, str]:
+    """Create a project, scan `target` into it, and return (project_id, scan_id)."""
+    project_id = client.post("/api/v1/projects", json={"name": name}).json()["id"]
+    response = client.post(
+        f"/api/v1/projects/{project_id}/scans",
+        json={"targets": [str(target)], "run_risk": True},
+    )
+    assert response.status_code in (200, 202), response.text
+    scan_id = response.json()["scan"]["id"]
+    _await_scan(client, scan_id)
+    return project_id, scan_id
+
+
+@pytest.fixture
+def two_projects(client: TestClient, tmp_path: Path) -> dict[str, Any]:
+    a_dir = tmp_path / "alpha"
+    a_dir.mkdir()
+    (a_dir / "billing.py").write_text(PROJECT_A_SOURCE, encoding="utf-8")
+    b_dir = tmp_path / "beta"
+    b_dir.mkdir()
+    (b_dir / "marker.py").write_text(PROJECT_B_SOURCE, encoding="utf-8")
+
+    a_project, a_scan = _scan(client, "alpha", a_dir)
+    b_project, b_scan = _scan(client, "beta", b_dir)
+    return {
+        "a_project": a_project,
+        "a_scan": a_scan,
+        "b_project": b_project,
+        "b_scan": b_scan,
+    }
+
+
+# ── GET /projects/overview ───────────────────────────────────────────────────
+
+
+def test_overview_reports_each_project_separately(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    rows = client.get("/api/v1/projects/overview").json()
+    by_name = {row["name"]: row for row in rows}
+    assert set(by_name) == {"alpha", "beta"}
+
+    alpha, beta = by_name["alpha"], by_name["beta"]
+    # The whole point: neither project's counts include the other's assets.
+    assert alpha["assets"] > 0 and beta["assets"] > 0
+    assert alpha["scans"] == 1 and beta["scans"] == 1
+    assert alpha["vulnerable"] > 0
+    # alpha has RSA (Shor) and MD5 (Grover); beta has only SHA-1 (Grover).
+    assert alpha["shor"] >= 1, alpha
+    assert beta["shor"] == 0, beta
+    assert "SHA-1" in beta["top_algorithms"], beta["top_algorithms"]
+    assert "SHA-1" not in alpha["top_algorithms"], alpha["top_algorithms"]
+
+    for row in (alpha, beta):
+        assert row["latest_scan"] is not None
+        assert row["latest_scan"]["status"] == "succeeded"
+        # Risk ran inline, so a mean exists. `None` here would mean the tab shows "—" for a
+        # project that really was scored.
+        assert row["mean_risk"] is not None
+        assert 0.0 <= row["mean_risk"] <= 1.0
+
+
+def test_overview_reports_where_each_plan_has_actually_got_to(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """The plan's progress counts, which the Migration Hub's two progress sections are built on.
+
+    `tasks` and the rule-kind counts describe what a plan was BUILT as and never move. Separating
+    "ongoing" from "successful" needs to know where the work actually GOT to, which nothing on this
+    payload reported -- so the hub had no way to draw that distinction without fetching every
+    plan's whole queue. These come from the tasks' own FSM states, so a card can never disagree
+    with the queue it links to.
+    """
+    plan_id = client.get(f"/api/v1/migrate/plans?project_id={two_projects['a_project']}").json()[0][
+        "id"
+    ]
+    queue = client.get(f"/api/v1/migrate/plans/{plan_id}/queue").json()
+    assert queue, "the fixture must produce a plan with tasks for this to prove anything"
+
+    def plan_of(name: str) -> dict[str, Any]:
+        rows = client.get("/api/v1/projects/overview").json()
+        return next(r for r in rows if r["name"] == name)["plan"]
+
+    before = plan_of("alpha")
+    # Every field is present and adds up to the plan, rather than being absent or double-counting.
+    accounted = (
+        before["written"]
+        + before["prepared"]
+        + before["outstanding"]
+        + before["guided"]
+        + before["satisfied"]
+    )
+    assert accounted == len(queue), (
+        f"every task must land in exactly one progress bucket: {before} vs {len(queue)} tasks"
+    )
+    assert before["written"] == 0, "nothing has been generated or written yet"
+    assert before["prepared"] == 0
+    assert before["outstanding"] > 0, "a freshly built plan is entirely outstanding work"
+
+    # Generate one patch. That task must move out of `outstanding` and into `prepared` -- the exact
+    # transition that decides whether the hub calls this migration ongoing or finished.
+    task = next(t for t in queue if t["has_codemod"])
+    generated = client.post(
+        f"/api/v1/migrate/tasks/{task['id']}/generate", json={"generator": "template"}
+    )
+    assert generated.status_code == 200, generated.text
+
+    after = plan_of("alpha")
+    assert after["prepared"] == before["prepared"] + 1, after
+    assert after["outstanding"] == before["outstanding"] - 1, after
+    assert after["written"] == 0, "generating must not report anything as written to disk"
+
+
+def test_overview_is_empty_before_anything_is_scanned(client: TestClient) -> None:
+    assert client.get("/api/v1/projects/overview").json() == []
+
+
+def test_overview_route_is_not_shadowed_by_the_project_id_route(client: TestClient) -> None:
+    """`/projects/{project_id}` types its parameter as a UUID, so declaration order decides
+    whether `/projects/overview` resolves or 422s on 'overview' not being a UUID."""
+    assert client.get("/api/v1/projects/overview").status_code == 200
+
+
+def test_overview_counts_a_project_with_no_assets_as_zero_not_missing(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """An empty project must still appear. Dropping it would hide a scan that found nothing —
+    which is exactly the case worth seeing, because it may mean the scan was misconfigured."""
+    empty = tmp_path / "nothing"
+    empty.mkdir()
+    (empty / "notes.txt").write_text("no cryptography here", encoding="utf-8")
+    _scan(client, "empty-project", empty)
+
+    row = next(
+        r for r in client.get("/api/v1/projects/overview").json() if r["name"] == "empty-project"
+    )
+    assert row["assets"] == 0
+    assert row["vulnerable"] == 0
+    assert row["mean_risk"] is None  # not 0.0 — "unscored" and "scored zero" are different
+    assert row["top_algorithms"] == []
+    assert row["plan"] is None
+
+
+# ── Plans belong to a project ────────────────────────────────────────────────
+
+
+def test_a_scan_builds_a_plan_for_its_own_project(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """The reported bug, directly: after a scan, that project has a migration plan."""
+    rows = client.get("/api/v1/projects/overview").json()
+    alpha = next(r for r in rows if r["name"] == "alpha")
+
+    assert alpha["plan"] is not None, "scanning a project with vulnerable assets built no plan"
+    assert alpha["plan"]["tasks"] > 0
+    assert alpha["plan"]["scan_id"] == two_projects["a_scan"], (
+        "the plan should be scoped to the scan that produced it, not to the whole project"
+    )
+    assert alpha["plan"]["stale"] is False
+
+
+def test_plan_contains_only_its_own_project_assets(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    a_plans = client.get(
+        "/api/v1/migrate/plans", params={"project_id": two_projects["a_project"]}
+    ).json()
+    b_plans = client.get(
+        "/api/v1/migrate/plans", params={"project_id": two_projects["b_project"]}
+    ).json()
+    assert len(a_plans) == 1 and len(b_plans) == 1
+    assert a_plans[0]["project_id"] == two_projects["a_project"]
+    assert b_plans[0]["project_id"] == two_projects["b_project"]
+
+    a_queue = client.get(f"/api/v1/migrate/plans/{a_plans[0]['id']}/queue").json()
+    b_queue = client.get(f"/api/v1/migrate/plans/{b_plans[0]['id']}/queue").json()
+
+    a_files = {t["file_path"] for t in a_queue}
+    b_files = {t["file_path"] for t in b_queue}
+    assert a_files and b_files
+    assert not (a_files & b_files), "a project's queue contains another project's files"
+    assert all("billing.py" in f for f in a_files), a_files
+    assert all("marker.py" in f for f in b_files), b_files
+
+    # alpha's RSA-1024 must not appear anywhere in beta's queue.
+    assert any(t["algorithm"] == "RSA-1024" for t in a_queue), a_queue
+    assert not any(t["algorithm"] == "RSA-1024" for t in b_queue), b_queue
+
+
+def test_unfiltered_plan_listing_still_returns_every_plan(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """Without `project_id` the listing is global — the app relies on the filter, not on the
+    endpoint having silently become project-only."""
+    all_plans = client.get("/api/v1/migrate/plans").json()
+    assert len(all_plans) >= 2
+    assert {p["project_id"] for p in all_plans} >= {
+        two_projects["a_project"],
+        two_projects["b_project"],
+    }
+
+
+def test_a_plan_built_without_a_project_is_reported_as_unscoped(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """Plans predating scoping genuinely spanned everything. `project_id: null` says so, and the
+    project filter must exclude them rather than attributing them to a project they were not
+    built from."""
+    created = client.post("/api/v1/migrate/plans", json={"min_risk": 0}).json()
+    assert created["project_id"] is None
+    assert created["scan_id"] is None
+
+    filtered = client.get(
+        "/api/v1/migrate/plans", params={"project_id": two_projects["a_project"]}
+    ).json()
+    assert created["id"] not in {p["id"] for p in filtered}
+
+    # A global plan spans both projects, which is what makes it useless per-project.
+    queue = client.get(f"/api/v1/migrate/plans/{created['id']}/queue").json()
+    files = {t["file_path"] for t in queue}
+    assert any("billing.py" in f for f in files) and any("marker.py" in f for f in files), files
+
+
+def test_building_a_plan_for_an_unknown_project_is_404_not_an_empty_plan(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/api/v1/migrate/plans",
+        json={"min_risk": 0, "project_id": "00000000-0000-0000-0000-000000000000"},
+    )
+    assert response.status_code == 404, response.text
+
+
+def test_rescanning_marks_the_existing_plan_stale(
+    client: TestClient, two_projects: dict[str, Any], tmp_path: Path
+) -> None:
+    """A plan describes the snapshot it was built from. Once a newer scan lands, showing its queue
+    as current is a lie, so the overview flags it — and the second scan builds its own plan."""
+    project_id = two_projects["a_project"]
+    before = next(
+        r for r in client.get("/api/v1/projects/overview").json() if r["id"] == project_id
+    )
+    first_plan_id = before["plan"]["id"]
+
+    response = client.post(
+        f"/api/v1/projects/{project_id}/scans",
+        json={"targets": [str(tmp_path / "alpha")], "run_risk": True},
+    )
+    assert response.status_code in (200, 202), response.text
+    _await_scan(client, response.json()["scan"]["id"])
+
+    after = next(r for r in client.get("/api/v1/projects/overview").json() if r["id"] == project_id)
+    # The new scan built its own plan, so the newest plan is a different one and is NOT stale.
+    assert after["plan"]["id"] != first_plan_id
+    assert after["plan"]["stale"] is False
+    assert after["scans"] == 2
+
+    plans = client.get("/api/v1/migrate/plans", params={"project_id": project_id}).json()
+    assert len(plans) == 2
+
+
+def test_deleting_a_project_removes_its_plans(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """The new `project_id` column carries ON DELETE CASCADE. Without it, deleting a project would
+    leave its plans behind pointing at a project that no longer exists."""
+    project_id = two_projects["a_project"]
+    assert client.get("/api/v1/migrate/plans", params={"project_id": project_id}).json()
+
+    assert client.delete(f"/api/v1/projects/{project_id}").status_code == 204
+    assert client.get("/api/v1/migrate/plans", params={"project_id": project_id}).json() == []
+    # The other project is untouched.
+    assert client.get(
+        "/api/v1/migrate/plans", params={"project_id": two_projects["b_project"]}
+    ).json()
+
+
+def test_plan_stats_describe_the_work_not_just_its_size(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """The hub leads with these, so they have to be real. `automatable` is the one that changes how
+    the work is planned: a task with no codemod rule has to be changed by hand."""
+    plans = client.get(
+        "/api/v1/migrate/plans", params={"project_id": two_projects["a_project"]}
+    ).json()
+    stats = plans[0]["stats"]
+    assert stats["tasks"] > 0
+    assert stats["units"] > 0
+    assert 0 <= stats["automatable"] <= stats["tasks"]
+    assert stats["effort_points"] > 0
+    assert 0 < stats["effort_hours_low"] <= stats["effort_hours_high"]
+    assert sum(stats["by_algorithm"].values()) == stats["tasks"]
+
+    queue = client.get(f"/api/v1/migrate/plans/{plans[0]['id']}/queue").json()
+    assert sum(1 for t in queue if t["rule_id"]) == stats["automatable"]
+
+
+def test_queue_carries_the_asset_context_the_ui_shows(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """A queue row read "AES-128 · 0.412" with no way to tell a config finding from a certificate,
+    or a signing key from a hash — which is most of what decides how a task is handled."""
+    plans = client.get(
+        "/api/v1/migrate/plans", params={"project_id": two_projects["a_project"]}
+    ).json()
+    queue = client.get(f"/api/v1/migrate/plans/{plans[0]['id']}/queue").json()
+    assert queue
+
+    for task in queue:
+        assert task["unit_id"], "no execution unit, so the queue cannot be grouped by wave"
+        assert task["source_scanner"] == "code"
+        assert task["asset_type"]
+        assert task["file_path"]
+        assert task["effort_hours_low"] is not None
+        assert task["effort_hours_high"] is not None
+        assert task["effort_hours_low"] <= task["effort_hours_high"]
+        assert isinstance(task["effort_drivers"], list)
+
+
+def test_plan_timestamps_carry_a_timezone(client: TestClient, two_projects: dict[str, Any]) -> None:
+    """A plan's ``created_at`` must be unambiguous.
+
+    It was serialized with a bare ``.isoformat()`` on a value SQLite hands back naive, producing
+    ``2026-08-20T15:51:25.853134`` — which JavaScript parses as LOCAL time. On a UTC+5:30 machine
+    that made a plan built two seconds ago read as 5.5 hours older than the scan it was built from,
+    so the Migration Hub displayed "this plan is outdated, rebuild it" over every current plan.
+    Caught by screenshotting the shipped app, not by any assertion on the JSON.
+
+    `schemas._ensure_utc` exists for precisely this and is already applied to scans; this pins that
+    plans use it too, and that the two are therefore comparable.
+    """
+    from datetime import datetime
+
+    plans = client.get(
+        "/api/v1/migrate/plans", params={"project_id": two_projects["a_project"]}
+    ).json()
+    raw = plans[0]["created_at"]
+    parsed = datetime.fromisoformat(raw)
+    assert parsed.tzinfo is not None, f"plan created_at has no timezone: {raw!r}"
+
+    scan = client.get(f"/api/v1/scans/{two_projects['a_scan']}").json()
+    scan_created = datetime.fromisoformat(scan["created_at"])
+    assert scan_created.tzinfo is not None, scan["created_at"]
+
+    # The plan is built at the END of the scan, so it is never older than the scan that produced
+    # it. Comparing them at all requires both to be tz-aware — mixing one of each raises.
+    assert parsed >= scan_created, (
+        "the plan looks older than the scan it was built from, which is what makes the hub call "
+        "every fresh plan outdated"
+    )
+
+
+def test_deleting_a_scan_does_not_leave_a_plan_advertising_tasks_it_no_longer_has(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """Deleting a scan cascades its assets; a migration task cascades from its asset.
+
+    `stats_json` is denormalised and cascades from nothing, so the plan row survived advertising its
+    original task count over an empty queue. Measured before the fix: a project reporting 0 assets
+    and 0 scans still showed an active plan of "2 migration tasks" on the Migration Hub grid.
+
+    `scan_id` is ON DELETE SET NULL by design — the plan remains a real record that work was planned
+    — so the counts have to be recomputed rather than the row removed.
+    """
+    project_id = two_projects["a_project"]
+    before = next(
+        r for r in client.get("/api/v1/projects/overview").json() if r["id"] == project_id
+    )
+    assert before["plan"]["tasks"] > 0
+    plan_id = before["plan"]["id"]
+    assert client.get(f"/api/v1/migrate/plans/{plan_id}/queue").json()
+
+    assert client.delete(f"/api/v1/scans/{two_projects['a_scan']}").status_code == 204
+
+    after = next(r for r in client.get("/api/v1/projects/overview").json() if r["id"] == project_id)
+    assert after["assets"] == 0
+    queue = client.get(f"/api/v1/migrate/plans/{plan_id}/queue").json()
+    assert queue == [], "the tasks should have cascaded away with their assets"
+    assert after["plan"]["tasks"] == len(queue) == 0, (
+        f"plan still advertises {after['plan']['tasks']} tasks over an empty queue"
+    )
+    assert after["plan"]["status"] == "abandoned"
+    assert after["plan"]["units"] == 0
+
+    # The other project is untouched.
+    other = next(
+        r
+        for r in client.get("/api/v1/projects/overview").json()
+        if r["id"] == two_projects["b_project"]
+    )
+    assert other["plan"]["tasks"] > 0
+    assert other["plan"]["status"] == "active"
+
+
+def test_clearing_all_scans_empties_every_project_not_just_one(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """The main-panel "clear all scans" reset. Scope is every scan in every project — the single-
+    scan delete already proves the cascade and reconciliation per project; this proves it applies
+    across all of them in one call, not just the one a caller happened to pass."""
+    resp = client.delete("/api/v1/scans")
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == 2
+
+    rows = client.get("/api/v1/projects/overview").json()
+    by_name = {row["name"]: row for row in rows}
+    for name in ("alpha", "beta"):
+        assert by_name[name]["assets"] == 0
+        assert by_name[name]["scans"] == 0
+        assert by_name[name]["plan"]["status"] == "abandoned"
+
+    assert client.get(f"/api/v1/scans/{two_projects['a_scan']}").status_code == 404
+    assert client.get(f"/api/v1/scans/{two_projects['b_scan']}").status_code == 404
+    # Projects themselves survive a scan clear — only the scan history is what "clear all scans"
+    # promises, not the projects a fresh scan would need to land back into.
+    assert client.get(f"/api/v1/projects/{two_projects['a_project']}").status_code == 200
+
+    # Idempotent: clearing an already-empty scan list is a no-op, not an error.
+    again = client.delete("/api/v1/scans")
+    assert again.status_code == 200
+    assert again.json()["deleted"] == 0
+
+
+def test_resetting_removes_every_project_not_just_every_scan(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """The main-panel "Reset", one level stronger than "clear all scans".
+
+    `DELETE /scans` leaves project shells behind on purpose (a repeat scan needs somewhere to
+    land); `DELETE /projects` is the "start over" button next to New scan, and it takes the
+    projects themselves -- which cascades their scans, assets, tasks and plans the same way
+    deleting one project already does, just for all of them in one call.
+    """
+    resp = client.delete("/api/v1/projects")
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == 2
+
+    assert client.get("/api/v1/projects").json() == []
+    assert client.get("/api/v1/projects/overview").json() == []
+    assert client.get(f"/api/v1/projects/{two_projects['a_project']}").status_code == 404
+    assert client.get(f"/api/v1/projects/{two_projects['b_project']}").status_code == 404
+    assert client.get(f"/api/v1/scans/{two_projects['a_scan']}").status_code == 404
+
+    # Idempotent, like the scan reset.
+    again = client.delete("/api/v1/projects")
+    assert again.status_code == 200
+    assert again.json()["deleted"] == 0
+
+
+def _await_job(client: TestClient, job_id: str, timeout_s: float = 180.0) -> dict[str, Any]:
+    for _ in range(int(timeout_s * 10)):
+        job = client.get(f"/api/v1/jobs/{job_id}").json()
+        if job["status"] not in ("queued", "running"):
+            return job
+        time.sleep(0.1)
+    raise TimeoutError(f"job {job_id} did not finish")
+
+
+def test_initiate_migration_runs_the_whole_plan_and_writes_the_files(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """ "Initiate migration": one call migrates every ready task and writes the result to disk.
+
+    Doing this per task meant one request per finding, each held open for as long as the generator
+    took. This is the bulk path -- dispatched as a job, so the caller polls instead of waiting --
+    and it must actually change the file on disk, not just record an approved patch.
+    """
+    target = tmp_path / "bulk"
+    target.mkdir()
+    source = target / "hashing.py"
+    source.write_text(PROJECT_A_SOURCE, encoding="utf-8")
+
+    project_id, scan_id = _scan(client, "bulk-migrate", target)
+    plan_id = client.post(
+        "/api/v1/migrate/plans", json={"min_risk": 0, "project_id": project_id, "scan_id": scan_id}
+    ).json()["id"]
+    ready_before = [
+        t
+        for t in client.get(f"/api/v1/migrate/plans/{plan_id}/queue").json()
+        if t["state"] == "ready"
+    ]
+    assert ready_before, "nothing to migrate, so this test would prove nothing"
+    assert "md5" in source.read_text(encoding="utf-8")
+
+    started = client.post(f"/api/v1/migrate/plans/{plan_id}/run", json={"apply": True})
+    assert started.status_code == 202, started.text
+    job = _await_job(client, started.json()["job"]["id"])
+    assert job["status"] == "succeeded", job
+
+    result = job["result"]
+    assert result["total"] == len(ready_before)
+    assert result["generated"] >= 1, result
+    assert result["applied"] >= 1, result
+    assert result["repo_root"] == str(target)
+
+    # The point of the whole thing: the working tree actually changed.
+    assert "md5" not in source.read_text(encoding="utf-8"), source.read_text(encoding="utf-8")
+    assert "sha256" in source.read_text(encoding="utf-8").lower()
+
+
+def test_running_a_plan_with_nothing_ready_is_a_conflict_not_a_silent_success(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """An empty run must not report success -- "migration complete" over zero work is a lie."""
+    plan_id = client.get(f"/api/v1/migrate/plans?project_id={two_projects['a_project']}").json()[0][
+        "id"
+    ]
+    assert client.delete(f"/api/v1/scans/{two_projects['a_scan']}").status_code == 204
+
+    resp = client.post(f"/api/v1/migrate/plans/{plan_id}/run", json={"apply": False})
+    assert resp.status_code == 409
+    assert "no ready tasks" in resp.json()["detail"]
+
+
+def test_writing_before_anything_was_generated_says_so(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """ "Initiate migration" with nothing prepared must point at the step that prepares it.
+
+    The readiness check is asked a different question by each half. A writing run needs PREPARED
+    PATCHES, not `ready` tasks -- checking `ready` would have refused the button on exactly the
+    plan it is meant for, one whose findings have all been generated and are waiting to be read.
+    """
+    plan_id = client.get(f"/api/v1/migrate/plans?project_id={two_projects['a_project']}").json()[0][
+        "id"
+    ]
+
+    resp = client.post(
+        f"/api/v1/migrate/plans/{plan_id}/run", json={"generate": False, "apply": True}
+    )
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert "no prepared changes" in detail.lower(), detail
+    assert "Build the plan" in detail, "the message has to name the step that fixes it"
+
+
+def test_running_a_plan_with_only_unresolved_tasks_retries_instead_of_409ing(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The BULK run endpoint must see the same retryable work the per-task one already does.
+
+    `migrate_handler` resumes every `deferred`/`unresolved` task before generating for it — that
+    is the whole point of the resume mechanism ("the engine learns between runs"). But this
+    endpoint's own pre-check only counted `state == "ready"`, so once a plan's last `ready` task
+    was consumed, it 409'd "no ready tasks" forever afterwards, even with genuinely retryable
+    work sitting in `unresolved`. Found live on OpenSSL: 1912/1912 tasks had settled into terminal
+    states (0 left `ready`) while 98 sat `unresolved` after a code fix made them retryable — from
+    that point on, "Rebuild Plan" refused every click, and those 98 findings were permanently
+    unreachable from the UI.
+    """
+    from qubit_migrate.transform import llm
+
+    src_dir = tmp_path / "hashonly"
+    src_dir.mkdir()
+    (src_dir / "app.py").write_text(
+        "import hashlib\ndigest = hashlib.md5(data)\n", encoding="utf-8"
+    )
+    project_id, scan_id = _scan(client, "hashonly", src_dir)
+    plan_id = client.post(
+        "/api/v1/migrate/plans", json={"min_risk": 0, "project_id": project_id, "scan_id": scan_id}
+    ).json()["id"]
+    task_id = client.get(f"/api/v1/migrate/plans/{plan_id}/queue").json()[0]["id"]
+
+    def refuse(prompt, *, model, base_url="x", timeout=0, **_):
+        raise llm.OllamaError("the model returned the file unchanged")
+
+    monkeypatch.setattr(llm, "_ollama_generate", refuse)
+    failed = client.post(f"/api/v1/migrate/tasks/{task_id}/generate", json={"generator": "llm"})
+    assert failed.status_code == 422, failed.text
+
+    queue = client.get(f"/api/v1/migrate/plans/{plan_id}/queue").json()
+    assert [t["state"] for t in queue] == ["deferred"]
+    assert queue[0]["resolution"] == "unresolved"
+    assert not [t for t in queue if t["state"] == "ready"], "the plan must have zero ready tasks"
+
+    monkeypatch.setattr(
+        llm,
+        "_ollama_generate",
+        lambda prompt, *, model, base_url="x", timeout=0, **_: (
+            "```python\nimport hashlib\ndigest = hashlib.sha256(data)\n```"
+        ),
+    )
+    resp = client.post(
+        f"/api/v1/migrate/plans/{plan_id}/run", json={"generate": True, "apply": False}
+    )
+    assert resp.status_code == 202, (
+        f"a bulk run with only unresolved tasks must dispatch, not 409: {resp.text[:300]}"
+    )
+    job = _await_job(client, resp.json()["job"]["id"])
+    assert job["status"] == "succeeded", job
+    assert job["result"]["generated"] >= 1, job["result"]
+
+    retried = client.get(f"/api/v1/migrate/plans/{plan_id}/queue").json()[0]
+    assert retried["state"] == "proposed"
+
+
+def test_generating_a_patch_twice_is_a_conflict_not_a_crash(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """Double-clicking Generate must not 500.
+
+    The task FSM only allows the `generate` event from state `ready`, and the second call arrives
+    with the task already in `proposed`. `InvalidTransition` was not among the exceptions the route
+    caught, so it escaped as a 500 with a stack trace — reachable from the app by clicking Generate
+    twice before the queue refetches.
+    """
+    plans = client.get(
+        "/api/v1/migrate/plans", params={"project_id": two_projects["a_project"]}
+    ).json()
+    queue = client.get(f"/api/v1/migrate/plans/{plans[0]['id']}/queue").json()
+    task = next((t for t in queue if t["has_codemod"]), None)
+    assert task is not None, "no task with a deterministic codemod to generate from"
+
+    first = client.post(
+        f"/api/v1/migrate/tasks/{task['id']}/generate", json={"generator": "template"}
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        f"/api/v1/migrate/tasks/{task['id']}/generate", json={"generator": "template"}
+    )
+    assert second.status_code == 409, (
+        f"expected a conflict, got {second.status_code}: {second.text[:200]}"
+    )
+    assert "already has a generated patch" in second.json()["detail"]
+
+    # And exactly one patch was stored — a second would leave two conflicting diffs for one task.
+    patches = client.get(f"/api/v1/migrate/tasks/{task['id']}/patches").json()
+    assert len(patches) == 1
+
+
+def test_generate_on_a_previously_failed_task_retries_instead_of_409ing(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A task whose last attempt FAILED must be retryable through the very same endpoint.
+
+    A failed generation parks the task `deferred`/`unresolved`, and the FSM has no `generate`
+    event from `deferred` -- so calling this endpoint again used to raise `InvalidTransition`,
+    which the route maps to 409 "this task already has a generated patch, review or reject it".
+    That message is simply wrong here: the task has no patch, only a rejection. The orchestrator
+    now resumes a failed task before generating, so this is the row's "Retry" button working
+    through the real API, not just the orchestrator layer `test_llm_generation.py` already pins.
+    """
+    from qubit_migrate.transform import llm
+
+    src_dir = tmp_path / "hashonly"
+    src_dir.mkdir()
+    (src_dir / "app.py").write_text(
+        "import hashlib\ndigest = hashlib.md5(data)\n", encoding="utf-8"
+    )
+    project_id, scan_id = _scan(client, "hashonly", src_dir)
+    plan_id = client.post(
+        "/api/v1/migrate/plans", json={"min_risk": 0, "project_id": project_id, "scan_id": scan_id}
+    ).json()["id"]
+    queue = client.get(f"/api/v1/migrate/plans/{plan_id}/queue").json()
+    task = queue[0]
+
+    def refuse(prompt, *, model, base_url="x", timeout=0, **_):
+        raise llm.OllamaError("the model returned the file unchanged")
+
+    monkeypatch.setattr(llm, "_ollama_generate", refuse)
+    failed = client.post(f"/api/v1/migrate/tasks/{task['id']}/generate", json={"generator": "llm"})
+    assert failed.status_code == 422, failed.text
+
+    queue_after_failure = client.get(f"/api/v1/migrate/plans/{plan_id}/queue").json()
+    parked = next(t for t in queue_after_failure if t["id"] == task["id"])
+    assert parked["state"] == "deferred"
+    assert parked["resolution"] == "unresolved"
+
+    monkeypatch.setattr(
+        llm,
+        "_ollama_generate",
+        lambda prompt, *, model, base_url="x", timeout=0, **_: (
+            "```python\nimport hashlib\ndigest = hashlib.sha256(data)\n```"
+        ),
+    )
+    retried = client.post(f"/api/v1/migrate/tasks/{task['id']}/generate", json={"generator": "llm"})
+    assert retried.status_code == 200, (
+        f"a retry on a failed task must succeed or fail on its own merits, not 409: "
+        f"{retried.text[:300]}"
+    )
+    assert "already has a generated patch" not in retried.text
+    assert "sha256" in retried.json()["diff_text"]
+
+
+def test_a_plan_built_before_the_split_still_reports_it(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """Plans predating the automatic/LLM/manual split carry only `automatable`.
+
+    Rendering those as "0 automatic, 0 LLM-assisted" is wrong wherever `automatable` is non-zero —
+    measured on the live installation, 2 of 7 plans were in that state. The counts are derived from
+    the plan's own tasks when the stored stats lack them, so an old plan reads correctly without a
+    rebuild.
+    """
+    from qubit_migrate.state import MigrationPlan
+    from sqlalchemy import select as sa_select
+
+    project_id = two_projects["a_project"]
+    plans = client.get("/api/v1/migrate/plans", params={"project_id": project_id}).json()
+    plan_id = plans[0]["id"]
+    expected = {k: plans[0]["stats"][k] for k in ("with_codemod", "with_llm_rule", "manual")}
+    assert sum(expected.values()) == plans[0]["stats"]["tasks"]
+
+    # Rewrite the stored stats into the shape a pre-split plan has. A direct session against the
+    # same database, rather than the request-scoped dependency, which needs a Request.
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    engine = create_engine(client.app.state.settings.db_url)  # type: ignore[attr-defined]
+    with Session(engine) as session:
+        row = session.scalars(
+            sa_select(MigrationPlan).where(MigrationPlan.id == UUID(plan_id))
+        ).one()
+        row.stats_json = {k: v for k, v in (row.stats_json or {}).items() if k not in expected}
+        session.add(row)
+        session.commit()
+    engine.dispose()
+
+    again = client.get("/api/v1/migrate/plans", params={"project_id": project_id}).json()[0]
+    assert {k: again["stats"][k] for k in expected} == expected, (
+        "a plan with no stored split should have it derived from its tasks"
+    )
+
+    row_out = next(
+        r for r in client.get("/api/v1/projects/overview").json() if r["id"] == project_id
+    )
+    assert row_out["plan"]["with_codemod"] == expected["with_codemod"]
+    assert row_out["plan"]["manual"] == expected["manual"]
+
+
+def test_advice_endpoint_explains_a_finding_that_cannot_be_patched(
+    client: TestClient, two_projects: dict[str, Any], tmp_path: Path
+) -> None:
+    """The queue's answer for an unpatchable finding used to be "manual change" and nothing else.
+
+    This is the other half: what the code does, why it is a problem, what to change in THIS file,
+    what it breaks, and how to prove it is gone — written by the local model from the real source,
+    with the target taken from QUBIT's own knowledge base rather than the model's recollection.
+
+    Skips when Ollama is not running; it is a real generation, not a mock, because the defect this
+    guards against (recommending RSA-2048 to replace RSA-1024) only appears when a model answers.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=3) as probe:
+            ollama_up = probe.status == 200
+    except (urllib.error.URLError, TimeoutError, OSError):
+        ollama_up = False
+    if not ollama_up:
+        pytest.skip("no Ollama server on 127.0.0.1:11434")
+
+    plans = client.get(
+        "/api/v1/migrate/plans", params={"project_id": two_projects["a_project"]}
+    ).json()
+    queue = client.get(f"/api/v1/migrate/plans/{plans[0]['id']}/queue").json()
+    task = queue[0]
+    assert task["advice_text"] is None, "advice should not be generated until it is asked for"
+
+    response = client.post(f"/api/v1/migrate/tasks/{task['id']}/advise", json={"force": False})
+    assert response.status_code == 200, response.text
+    advised = response.json()
+
+    assert advised["advice_text"], "no advice was produced"
+    assert advised["advice_model"], "the model that wrote it must be recorded"
+    for heading in ("WHAT TO CHANGE", "HOW TO VERIFY"):
+        assert heading.lower() in advised["advice_text"].lower(), advised["advice_text"]
+
+    # It must never recommend something the registry itself rates quantum-vulnerable.
+    from qubit_migrate.transform.advise import recommended_vulnerable_algorithms
+
+    assert recommended_vulnerable_algorithms(advised["advice_text"], task["algorithm"]) == [], (
+        advised["advice_text"]
+    )
+
+    # Cached: a second call without `force` returns the same text rather than paying for the model.
+    again = client.post(f"/api/v1/migrate/tasks/{task['id']}/advise", json={"force": False}).json()
+    assert again["advice_text"] == advised["advice_text"]
+
+
+# ── Planning one scan twice is a duplicate, not a second opinion ──────────────
+
+
+def test_planning_the_same_scan_twice_returns_the_same_plan(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """Measured against the running app: one scan ended up with THREE plans.
+
+    A scan builds a plan automatically when it finishes, and every explicit POST built another --
+    each holding the same findings, with nothing to say which was the real one. On the polyglot
+    corpus that is two plans of 127 tasks each, and in the app it is reachable by clicking
+    "create plan" twice. `generate_patch` already guards the same double-click for a single task.
+    """
+    scan_id = two_projects["a_scan"]
+    first = client.post("/api/v1/migrate/plans", json={"min_risk": 0.0, "scan_id": scan_id}).json()
+    second = client.post("/api/v1/migrate/plans", json={"min_risk": 0.0, "scan_id": scan_id}).json()
+
+    assert first["id"] == second["id"], "planning the same scan twice created a duplicate plan"
+
+    plans = client.get("/api/v1/migrate/plans").json()
+    for_scan = [p for p in plans if p.get("scan_id") == scan_id]
+    assert len(for_scan) == 1, f"expected one plan for this scan, found {len(for_scan)}"
+
+
+def test_force_builds_a_second_plan_deliberately(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """Re-planning at a different threshold is legitimate; it just has to be asked for."""
+    scan_id = two_projects["a_scan"]
+    first = client.post("/api/v1/migrate/plans", json={"min_risk": 0.0, "scan_id": scan_id}).json()
+    forced = client.post(
+        "/api/v1/migrate/plans", json={"min_risk": 0.5, "scan_id": scan_id, "force": True}
+    ).json()
+
+    assert forced["id"] != first["id"]
+
+
+def test_a_plan_with_no_scan_is_never_deduplicated(
+    client: TestClient, two_projects: dict[str, Any]
+) -> None:
+    """An unscoped plan has no scan to be the duplicate OF, so the old behaviour must survive."""
+    first = client.post("/api/v1/migrate/plans", json={"min_risk": 0.0}).json()
+    second = client.post("/api/v1/migrate/plans", json={"min_risk": 0.0}).json()
+    assert first["id"] != second["id"]

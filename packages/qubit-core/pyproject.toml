@@ -1,0 +1,36 @@
+[project]
+name = "qubit-core"
+version = "0.1.0"
+description = "QUBIT shared core: CryptoAsset schema, algorithm registry, fingerprinting, DB, CBOM"
+requires-python = ">=3.12,<3.14"
+license = "MIT"
+readme = "README.md"
+dependencies = [
+  "pydantic>=2.7",
+  "sqlalchemy>=2.0.30",
+  "alembic>=1.13",
+  "platformdirs>=4.2",
+  # Reversible encryption for the LLM provider API key (qubit_core.db.secrets_at_rest). Needed
+  # here, not just in qubit-api, because qubit-migrate's orchestrator decrypts the key directly
+  # and does not depend on qubit-scanner (the only other package that already pulls this in).
+  "cryptography>=43.0",
+]
+
+[project.optional-dependencies]
+# Optional hosted-Postgres backend (e.g. Neon). Default stays offline SQLite.
+# Enable with: uv sync --extra postgres
+postgres = ["psycopg[binary]>=3.2"]
+# PDF report generation. reportlab is pure Python (BSD) with no system libraries, so it keeps the
+# "fully offline, no telemetry" property that a headless PDF renderer like WeasyPrint would break
+# (it needs Cairo/Pango). Imported lazily inside report/pdf.py so nothing pays for it on start-up.
+pdf = ["reportlab>=4.2"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qubit_core"]
+
+[tool.mypy]
+strict = true

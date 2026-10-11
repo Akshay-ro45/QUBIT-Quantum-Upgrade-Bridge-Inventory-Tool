@@ -1,0 +1,154 @@
+schema: qubit-rule/v1
+language: javascript
+library:
+  name: node:crypto
+  # No import gate: resolve.py has no JS import-extraction query yet (see javascript/jwt.yaml), and
+  # `crypto` is reachable as a global in modern Node without any import at all.
+  detect_imports: []
+rules:
+  # NOTE ON THE `function:` ALTERNATION BELOW
+  #
+  # Every rule in this file used to match only `crypto.createX(...)` — a member expression with
+  # `object` captured and required to be `crypto`. `import { createHash } from 'crypto'` followed by
+  # a bare `createHash('md5')` matched NOTHING, in both grammars. That is the idiomatic modern
+  # ESM/TypeScript form, so a contemporary Node service scanned clean: measured at 0 of 6 crypto
+  # sites detected, against 5-6 of 6 for Java, Go, C#, PHP and Ruby on the same probe.
+  #
+  # The alternation binds `@meth` in both branches. The `obj` filter had to go with it: `_where_ok`
+  # returns False when a capture is ABSENT, so a rule that still required `obj == crypto` would
+  # have left the new branch dead. The cost is that `other.createHash('md5')` now matches too —
+  # accepted, because these are Node-crypto-specific method names and the alternative was an
+  # entire ecosystem being invisible.
+  # Node's built-in `crypto` module was previously invisible to QUBIT — the only JavaScript rules
+  # were the two JWT ones — so the single most common source of crypto in Node codebases produced
+  # zero findings. These cover the four entry points that actually appear in application code:
+  # createHash, createCipheriv, createHmac, and generateKeyPairSync.
+  #
+  # The algorithm name is read from the string argument rather than hardcoded per-rule, so one rule
+  # covers every digest/cipher Node accepts and the canonical registry decides the verdict (doc 01
+  # §4.2: rules only NAME algorithms, they never judge them). Unrecognised names surface as
+  # UNKNOWN(...) rather than being dropped.
+  - id: JS-NODE-CREATEHASH
+    title: crypto.createHash(<digest>)
+    match:
+      query: |
+        (call_expression
+          function: [
+            (member_expression property: (property_identifier) @meth)
+            (identifier) @meth
+          ]
+          arguments: (arguments (string (string_fragment) @alg))) @call
+      where:
+        - { capture: meth, equals: createHash }
+    extract:
+      algorithm: { from: alg, resolve: capture-text }
+    asset: { asset_type: algorithm-use, usage_context: hash }
+    confidence: high
+    examples:
+      positive:
+        - |
+          const crypto = require('crypto');
+          const h = crypto.createHash('md5').update(data).digest('hex');
+        - |
+          const crypto = require('crypto');
+          const h = crypto.createHash('sha256').update(data).digest('hex');
+      negative:
+        - |
+          const crypto = require('crypto');
+          const h = crypto.randomBytes(32);
+
+  - id: JS-NODE-CREATECIPHERIV
+    title: crypto.createCipheriv / createDecipheriv(<cipher>, key, iv)
+    match:
+      query: |
+        (call_expression
+          function: [
+            (member_expression property: (property_identifier) @meth)
+            (identifier) @meth
+          ]
+          arguments: (arguments (string (string_fragment) @alg) (_) (_))) @call
+      where:
+        # createDecipheriv too: decryption is as much a crypto usage as encryption, and a
+        # service that only ever DECRYPTS — an ingest or consumer tier, a very common
+        # architecture — otherwise reported no cipher usage at all. Found by scanning a
+        # telemetry ingest target that decrypts RC4 payloads and got zero cipher findings.
+        - { capture: meth, in: [createCipheriv, createDecipheriv] }
+    extract:
+      algorithm: { from: alg, resolve: capture-text }
+      mode:
+        from: call
+        resolve: cipher-mode
+    asset: { asset_type: algorithm-use, usage_context: encryption-at-rest }
+    confidence: high
+    examples:
+      positive:
+        - |
+          const crypto = require('crypto');
+          const c = crypto.createCipheriv('aes-128-cbc', key, iv);
+        - |
+          const crypto = require('crypto');
+          const c = crypto.createCipheriv('des-ede3-cbc', key, iv);
+        - |
+          const crypto = require('crypto');
+          const d = crypto.createDecipheriv('rc4', key, iv);
+      negative:
+        - |
+          const crypto = require('crypto');
+          const h = crypto.createHash('sha256');
+
+  - id: JS-NODE-CREATEHMAC
+    title: crypto.createHmac(<digest>, key)
+    match:
+      query: |
+        (call_expression
+          function: [
+            (member_expression property: (property_identifier) @meth)
+            (identifier) @meth
+          ]
+          arguments: (arguments (string (string_fragment) @alg) (_))) @call
+      where:
+        - { capture: meth, equals: createHmac }
+    extract:
+      # `@alg` is already the digest string ("sha256"), so it is right there — see
+      # python/cryptography_more.yaml's PY-HMAC-NEW for why this must not be `{literal: HMAC}`.
+      algorithm: { from: alg, resolve: hmac-digest }
+    asset: { asset_type: algorithm-use, usage_context: token }
+    confidence: high
+    examples:
+      positive:
+        - |
+          const crypto = require('crypto');
+          const mac = crypto.createHmac('sha256', secret).update(msg).digest();
+      negative:
+        - |
+          const crypto = require('crypto');
+          const h = crypto.createHash('sha256').update(msg).digest();
+
+  - id: JS-NODE-GENERATEKEYPAIR-RSA
+    title: crypto.generateKeyPairSync('rsa', ...)
+    match:
+      query: |
+        (call_expression
+          function: [
+            (member_expression property: (property_identifier) @meth)
+            (identifier) @meth
+          ]
+          arguments: (arguments (string (string_fragment) @alg) (_))) @call
+      where:
+        - { capture: meth, in: [generateKeyPairSync, generateKeyPair] }
+    extract:
+      algorithm: { from: alg, resolve: capture-text }
+    asset: { asset_type: algorithm-use, usage_context: kex }
+    confidence: high
+    examples:
+      positive:
+        - |
+          const crypto = require('crypto');
+          const { publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+        - |
+          const crypto = require('crypto');
+          const { publicKey } = crypto.generateKeyPairSync('ed25519', {});
+      negative:
+        - |
+          const crypto = require('crypto');
+          const mac = crypto.createHmac('sha256', secret);

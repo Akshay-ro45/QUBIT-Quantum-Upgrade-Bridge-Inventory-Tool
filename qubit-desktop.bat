@@ -1,0 +1,111 @@
+@echo off
+REM ============================================================================
+REM  QUBIT desktop (native) launcher - Windows
+REM
+REM  Runs the API + dashboard NATIVELY on your machine (one process), so the
+REM  scanner can read local paths (X:\...) AND clone git repos - which the
+REM  container build could not do. Docker + Ollama are still used BY this native
+REM  API for the migration sandbox and the LLM patch tier.
+REM
+REM  Double-click this file. It will:
+REM    1. install Python deps (first run only),
+REM    2. build the dashboard fresh, every run,
+REM    3. start the native API serving the dashboard at http://127.0.0.1:8787,
+REM    4. open it in an app window.
+REM  Close the console window to stop it.
+REM ============================================================================
+setlocal
+cd /d "%~dp0"
+title QUBIT desktop
+
+REM --- Port selection -----------------------------------------------------------
+REM  8787 is the preferred port but it is NOT always bindable. Windows reserves blocks of ports for
+REM  Hyper-V / WSL / Docker, and on a machine where Hyper-V has claimed 8695-8794 (check with
+REM  `netsh int ipv4 show excludedportrange protocol=tcp`) binding 8787 fails outright with
+REM  WinError 10013 -- "an attempt was made to access a socket in a way forbidden by its access
+REM  permissions" -- even though nothing is listening on it. Hardcoding the port meant the launcher
+REM  simply died on those machines. So ask the OS for a port we can actually bind, trying the
+REM  familiar one first. The dashboard does not care which port wins: the API injects its own base
+REM  URL into the page it serves, so the front-end follows automatically.
+for /f "usebackq delims=" %%p in (`uv run python scripts\pick_port.py`) do set "PORT=%%p"
+if not defined PORT set "PORT=8787"
+set "URL=http://127.0.0.1:%PORT%"
+set "DIST=%CD%\dashboard\dist"
+REM The dashboard bundle's default token; keep in sync with QUBIT_API_TOKEN below.
+set "QUBIT_API_TOKEN=dev_token"
+set "QUBIT_DASHBOARD_DIST=%DIST%"
+
+echo(
+echo   QUBIT - Quantum Upgrade Bridge ^& Inventory Tool  (native desktop)
+echo   ----------------------------------------------------------------
+
+REM --- 1. Python deps (uv) -----------------------------------------------------
+where uv >nul 2>&1
+if errorlevel 1 (
+  echo   ERROR: `uv` not found. Install it: https://docs.astral.sh/uv/  then re-run.
+  pause & exit /b 1
+)
+if not exist ".venv" (
+  echo   [1/4] Installing Python packages (first run - a few minutes)...
+  call uv sync --all-packages
+) else (
+  echo   [1/4] Python packages present.
+)
+
+REM --- 2. Dashboard build ------------------------------------------------------
+REM  Always rebuilds. It used to run only when dist\index.html was missing, which meant the
+REM  very first build was the LAST one -- every dashboard/backend-contract change after that sat
+REM  in dist untouched, launch after launch, with nothing in this script's own output saying so
+REM  ("Dashboard build present." looked like a confirmation, not a warning). The build itself is a
+REM  few seconds; skipping it saved nothing worth the staleness.
+echo   [2/4] Building the dashboard...
+pushd dashboard
+if not exist "node_modules" ( call npm install )
+set "VITE_API_BASE=/api/v1"
+set "VITE_API_TOKEN=dev_token"
+call npm run build
+popd
+
+REM --- 3. Optional: note Docker/Ollama (used by migration + LLM tiers) ---------
+docker info >nul 2>&1
+if errorlevel 1 (
+  echo   Note: Docker not running - migration sandbox validation will be limited.
+) else (
+  echo   Docker is available (used for migration sandbox).
+)
+curl -s -o nul --max-time 3 http://localhost:11434/api/tags
+if errorlevel 1 (
+  echo   Note: Ollama not detected - LLM patches need it; template patches still work.
+)
+
+REM --- 4. Start the native API (serves the dashboard too) ----------------------
+echo   [3/4] Starting QUBIT at %URL% ...
+start "QUBIT API" /min cmd /c "uv run uvicorn qubit_api.main:app --host 127.0.0.1 --port %PORT%"
+
+echo   [4/4] Waiting for it to be ready...
+set /a _t=0
+:wait
+timeout /t 1 >nul
+curl -s -o nul --max-time 2 %URL%/api/v1/health
+if not errorlevel 1 goto ready
+set /a _t+=1
+if %_t% geq 40 ( echo   WARNING: startup slow - opening anyway. & goto open )
+goto wait
+:ready
+echo   Ready.
+
+:open
+REM Prefer an app-mode window (no browser chrome); fall back to the default browser.
+set "EDGE=%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"
+set "CHROME=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
+if exist "%EDGE%" ( start "" "%EDGE%" --app=%URL% ) ^
+else if exist "%CHROME%" ( start "" "%CHROME%" --app=%URL% ) ^
+else ( start "" %URL% )
+
+echo(
+echo   QUBIT is running at %URL%
+echo   The scanner runs natively - you can scan any local path (e.g. X:\projects\...)
+echo   or paste a git repo URL. Close this window to stop QUBIT.
+echo(
+pause
+endlocal

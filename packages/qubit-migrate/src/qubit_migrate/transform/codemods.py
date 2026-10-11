@@ -1,0 +1,792 @@
+"""Deterministic codemods — template transforms, no LLM (doc 03 §6.3).
+
+These handle every transform that can be made SAFELY without a model:
+
+* Python weak-hash swaps via libcst (`weakhash_to_argon2_or_sha256`).
+* Non-Python weak-hash swaps via line-scoped token replacement (`weakhash_to_sha256`).
+* nginx / Apache / OpenSSH hardening, including the hybrid post-quantum key exchange
+  (`harden_tls_config` — see config_codemods.py for why this is the highest-value transform).
+* Crypto dependency version bumps that make PQC primitives available (`bump_crypto_dependency`).
+
+Cipher swaps and key-exchange/signature rewrites are deliberately NOT here: changing DES to AES
+alters key and IV lengths, and moving RSA key transport to a KEM changes the shape of the protocol,
+so both need the LLM path with explicit constraints plus sandbox validation.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from pathlib import Path
+
+from qubit_core import CryptoAsset
+
+from .config_codemods import harden_config_file
+from .languages import SUFFIX_TO_LANGUAGE as _SUFFIX_TO_LANGUAGE
+
+# ---------------------------------------------------------------------------
+# py-weakhash-01 codemod
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Dependency version bumps (manifest patches)
+# ---------------------------------------------------------------------------
+# A code patch to ML-KEM is un-appliable if the pinned library predates PQC support, so this runs
+# ahead of the structural rewrites: it is the change that makes the PQC primitives available at all.
+# Minimum versions come from the same facts recorded in docs/design/07-ecosystem-factcheck.md §10.
+_MIN_PQC_VERSIONS: dict[str, str] = {
+    # Package name (lowercased, `_` normalised to `-`) -> first version providing PQC primitives.
+    # Each is a version where the SAME library gained them, which is what makes a floor bump the
+    # right transform. Where an ecosystem instead requires adding a NEW package, no entry belongs
+    # here — see the note under `dep-pqc-01`.
+    "cryptography": "48.0.0",  # pyca/cryptography ships native ML-KEM + ML-DSA from 48
+    "bcprov-jdk18on": "1.79",  # BouncyCastle Java ships ML-KEM/ML-DSA/SLH-DSA from 1.79
+    "bouncycastle.cryptography": "2.5.0",  # BouncyCastle .NET, same algorithms, from 2.5.0
+}
+
+_PY_PIN_RE = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)\s*(?P<op>==|>=|~=)\s*(?P<ver>[0-9][^\s;#]*)")
+
+
+def _version_tuple(text: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for chunk in re.split(r"[._-]", text):
+        if chunk.isdigit():
+            parts.append(int(chunk))
+        else:
+            break
+    return tuple(parts) or (0,)
+
+
+_MAVEN_DEP_RE = re.compile(
+    r"<artifactId>\s*(?P<name>[^<\s]+)\s*</artifactId>(?P<between>.*?)"
+    r"<version>\s*(?P<ver>[^<\s]+)\s*</version>",
+    re.DOTALL,
+)
+_NUGET_REF_RE = re.compile(
+    r'(?P<head><PackageReference\s+Include\s*=\s*"(?P<name>[^"]+)"[^/>]*?'
+    r'Version\s*=\s*")(?P<ver>[^"]+)(?P<tail>")',
+    re.IGNORECASE,
+)
+#: A pip requirement inside a quoted TOML string: `"cryptography==42.0.8"`.
+_TOML_PIN_RE = re.compile(
+    r'(?P<q>["\'])(?P<name>[A-Za-z0-9._-]+)\s*(?P<op>==|>=|~=)\s*(?P<ver>[0-9][^"\'\s;]*)(?P=q)'
+)
+
+
+def _floor_for(name: str) -> str | None:
+    """The PQC-capable floor for a package, or None if we have no verified one.
+
+    Keyed on the last colon-delimited segment so Maven's `groupId:artifactId` form resolves to the
+    same entry as the bare artifact id — see `rules._library_key`, which is the matching half of
+    this and documents the measured cost of the two disagreeing.
+    """
+    key = name.rsplit(":", 1)[-1].strip().lower().replace("_", "-")
+    return _MIN_PQC_VERSIONS.get(key)
+
+
+def _below_floor(current: str, floor: str) -> bool:
+    return _version_tuple(current) < _version_tuple(floor)
+
+
+def _bump_requirements(source: str) -> tuple[str, bool]:
+    """pip requirement lines: `cryptography==42.0.8`."""
+    changed = False
+    out: list[str] = []
+    for line in source.splitlines():
+        pin = _PY_PIN_RE.match(line.strip())
+        floor = _floor_for(pin.group("name")) if pin else None
+        if pin is None or floor is None or not _below_floor(pin.group("ver"), floor):
+            out.append(line)
+            continue
+        # `==` is deliberately relaxed to `>=`: pinning exactly would re-freeze the dependency at
+        # the very moment the point is to allow the PQC-capable line.
+        indent = line[: len(line) - len(line.lstrip())]
+        out.append(
+            f"{indent}{pin.group('name')}>={floor}  # QUBIT: version providing PQC primitives"
+        )
+        changed = True
+    return "\n".join(out) + ("\n" if source.endswith("\n") else ""), changed
+
+
+def _bump_pyproject(source: str) -> tuple[str, bool]:
+    """PEP 621 dependencies, where the pin lives inside a quoted string in an array.
+
+    `_PY_PIN_RE` anchors at the start of a stripped line, so it matched neither
+    `dependencies = ["cryptography==42.0.8"]` nor the one-per-line form, whose lines begin with a
+    quote. pyproject.toml was accepted by filename and then never modified.
+    """
+    changed = False
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        floor = _floor_for(match.group("name"))
+        if floor is None or not _below_floor(match.group("ver"), floor):
+            return match.group(0)
+        changed = True
+        q = match.group("q")
+        return f"{q}{match.group('name')}>={floor}{q}"
+
+    return _TOML_PIN_RE.sub(replace, source), changed
+
+
+def _bump_maven(source: str) -> tuple[str, bool]:
+    """Maven coordinates, where the version is its own element in the same <dependency> block.
+
+    A version given as a property (`<version>${bc.version}</version>`) is left alone: the real pin
+    is elsewhere in the file, and rewriting the reference would break the build rather than raise
+    the floor.
+    """
+    changed = False
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        floor = _floor_for(match.group("name"))
+        current = match.group("ver")
+        if floor is None or current.startswith("${") or not _below_floor(current, floor):
+            return match.group(0)
+        changed = True
+        return match.group(0).replace(f"<version>{current}<", f"<version>{floor}<")
+
+    return _MAVEN_DEP_RE.sub(replace, source), changed
+
+
+def _bump_nuget(source: str) -> tuple[str, bool]:
+    """.NET project references: `<PackageReference Include="X" Version="Y" />`."""
+    changed = False
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        floor = _floor_for(match.group("name"))
+        current = match.group("ver")
+        if floor is None or current.startswith("$(") or not _below_floor(current, floor):
+            return match.group(0)
+        changed = True
+        return f"{match.group('head')}{floor}{match.group('tail')}"
+
+    return _NUGET_REF_RE.sub(replace, source), changed
+
+
+def _apply_dependency_bump(source: str, filename: str) -> tuple[str, bool]:
+    """Raise a crypto library's pinned version to one that provides PQC primitives.
+
+    Only ever raises a floor, never lowers one — a project already ahead of the minimum is left
+    exactly as it is.
+
+    Dispatches on the manifest's real syntax. It previously applied the pip requirement regex to
+    all three formats it accepted, so only requirements.txt ever changed; pom.xml and pyproject.toml
+    were claimed by the rule and then silently produced nothing.
+    """
+    name = filename.lower()
+    if name == "requirements.txt":
+        return _bump_requirements(source)
+    if name == "pyproject.toml":
+        return _bump_pyproject(source)
+    if name == "pom.xml":
+        return _bump_maven(source)
+    if name.endswith((".csproj", ".vbproj", ".fsproj")):
+        return _bump_nuget(source)
+    return source, False
+
+
+# ---------------------------------------------------------------------------
+# Adding a PQC provider (manifests whose ecosystem has no in-library upgrade path)
+# ---------------------------------------------------------------------------
+# `bump_crypto_dependency` raises a floor, which only works where the SAME library gained PQC in a
+# later release (pyca/cryptography, BouncyCastle). In npm, Cargo, Composer and RubyGems there is no
+# such release: post-quantum support lives in a DIFFERENT package. A floor bump cannot express "add
+# a dependency", so those ecosystems had no rule at all and every finding in them was reported as
+# manual work — the largest single block of "no migration rule" on the 21-app demo corpus.
+#
+# Like `dep-pqc-01` this is a PREREQUISITE patch, not a migration on its own: it makes the PQC
+# primitives importable so the structural code rewrite has something to call. The rule says so.
+#
+# Every package and version below was verified against that ecosystem's own registry API at
+# authoring time rather than recalled — npm registry, crates.io and Packagist.
+#
+# ADOPTION IS PART OF THE BAR, not just existence. This tool tells people what to put in their
+# cryptographic dependency path, so an obscure package here is worse than no rule: it converts an
+# honest "no automated fix" into confident, automated bad advice, and the operator has no way to
+# know the difference. Each entry below was checked for real-world usage at authoring time, and
+# three candidates were REJECTED on that basis rather than included to raise a coverage number:
+#
+#   * RubyGems `ml_kem` — 836 downloads in total.
+#   * pub.dev `mlkem_native` — 107 downloads/30d, 0 likes; `custom_post_quantum` — 45/30d.
+#   * SwiftPM — no PQC provider established at all; `swift-crypto` 4.5.1 ships none.
+#
+# Ruby, Dart and Swift findings therefore stay on the guidance path, which says truthfully that no
+# vetted provider exists yet, rather than being handed a dependency nobody has vetted.
+_PQC_PROVIDERS: dict[str, tuple[str, str]] = {
+    # manifest filename (lowercased) -> (package, version constraint)
+    # npm 0.7.0, audited, ~346k downloads/week.
+    "package.json": ("@noble/post-quantum", "^0.7.0"),
+    # RustCrypto, crates.io 0.3.2, ~3.6M downloads/90d. Not independently audited — noted in the
+    # rule's semantic_note so the operator reviewing the patch is told.
+    "cargo.toml": ("ml-kem", "0.3.2"),
+    # Packagist v0.3.2. Adoption is modest (~1.3k/month), included because Paragon Initiative
+    # Enterprises is an established security vendor and this is the reference pure-PHP FIPS
+    # 203/204/205 implementation — there is no better-adopted alternative in the ecosystem.
+    "composer.json": ("paragonie/pqcrypto_compat", "^0.3.2"),
+}
+
+#: The `go` directive floor whose stdlib carries ML-KEM. Go is its own case: PQC arrived IN the
+#: standard library (`crypto/mlkem`, Go 1.24), so the transform is neither a package add nor a
+#: library floor but a LANGUAGE version bump. `crypto/mldsa` followed in 1.27; 1.24 is used here
+#: because it is what the KEM target needs, and demanding 1.27 for a key-exchange finding would
+#: force a toolchain upgrade this migration does not require.
+_GO_MLKEM_FLOOR = (1, 24)
+_GO_DIRECTIVE_RE = re.compile(
+    r"^(?P<indent>[ \t]*)go[ \t]+(?P<ver>\d+\.\d+(?:\.\d+)?)[ \t]*$", re.M
+)
+
+
+def _json_dep_insert(source: str, block: str, name: str, version: str) -> tuple[str, bool]:
+    """Insert `"name": "version"` as the first entry of a JSON manifest's dependency object.
+
+    Textual rather than `json.loads` + `json.dumps`: re-serialising reformats the whole file and
+    produces a diff nobody can review. Inserting FIRST means the new entry always carries a
+    trailing comma, which is valid whenever an entry follows; an empty object is handled separately
+    because there the comma would be a syntax error.
+    """
+    if f'"{name}"' in source:
+        return source, False  # already declared — idempotent
+    m = re.search(rf'"{re.escape(block)}"\s*:\s*\{{', source)
+    if m is None:
+        return source, False
+    brace = m.end() - 1
+    close = source.find("}", brace)
+    if close == -1:
+        return source, False
+    body = source[brace + 1 : close]
+    existing = re.search(r"\n(?P<indent>[ \t]+)\S", body)
+    indent = existing.group("indent") if existing else "    "
+    entry = f'"{name}": "{version}"'
+    injected = f"\n{indent}{entry}," if body.strip() else f"\n{indent}{entry}\n"
+    return source[: brace + 1] + injected + source[brace + 1 :], True
+
+
+def _add_cargo_dependency(source: str, name: str, version: str) -> tuple[str, bool]:
+    """Append to Cargo.toml's `[dependencies]` table, before the next section header."""
+    if re.search(rf"^[ \t]*{re.escape(name)}[ \t]*=", source, re.M):
+        return source, False
+    m = re.search(r"^\[dependencies\][ \t]*$", source, re.M)
+    if m is None:
+        return source, False
+    rest = source[m.end() :]
+    nxt = re.search(r"^\[", rest, re.M)
+    cut = m.end() + (nxt.start() if nxt else len(rest))
+    head, tail = source[:cut], source[cut:]
+    # Preserve the blank line that separated this table from the next section. Appending after it
+    # instead leaves the new pin abutting `[dev-dependencies]` — valid TOML, but it reads as a
+    # mistake in the diff a reviewer has to approve.
+    head = head.rstrip("\n") + "\n"
+    entry = f'{name} = "{version}"  # QUBIT: FIPS-203 ML-KEM provider\n'
+    separator = "\n" if tail.strip() else ""
+    return head + entry + separator + tail.lstrip("\n"), True
+
+
+def _bump_go_directive(source: str) -> tuple[str, bool]:
+    """Raise go.mod's `go` directive to the release whose stdlib carries `crypto/mlkem`."""
+    m = _GO_DIRECTIVE_RE.search(source)
+    if m is None:
+        return source, False
+    current = tuple(int(p) for p in m.group("ver").split(".")[:2])
+    if current >= _GO_MLKEM_FLOOR:
+        return source, False  # already at or past the floor
+    floor = ".".join(str(p) for p in _GO_MLKEM_FLOOR)
+    line = f"{m.group('indent')}go {floor}  // QUBIT: stdlib crypto/mlkem needs Go {floor}+"
+    return source[: m.start()] + line + source[m.end() :], True
+
+
+def _apply_add_pqc_dependency(source: str, filename: str) -> tuple[str, bool]:
+    """Make PQC primitives importable in a manifest whose ecosystem needs a new package.
+
+    npm, Composer, Cargo and Go are handled here because their edits are one-liners with
+    ecosystem-specific quirks already solved above. Everything else — Maven, Gradle, sbt, NuGet,
+    SwiftPM, pip — lives in `dependency_codemods`, which reads the same verified playbook the
+    guided paths quote.
+    """
+    name = filename.lower()
+    if name == "go.mod":
+        return _bump_go_directive(source)
+    provider = _PQC_PROVIDERS.get(name)
+    if provider is not None:
+        pkg, version = provider
+        if name == "package.json":
+            return _json_dep_insert(source, "dependencies", pkg, version)
+        if name == "composer.json":
+            return _json_dep_insert(source, "require", pkg, version)
+        if name == "cargo.toml":
+            return _add_cargo_dependency(source, pkg, version)
+    from .dependency_codemods import add_dependency_for_manifest
+
+    return add_dependency_for_manifest(source, filename)
+
+
+# ---------------------------------------------------------------------------
+# Cross-language weak-hash swaps (deterministic token replacement)
+# ---------------------------------------------------------------------------
+# libcst only understands Python, and importing qubit-scanner's tree-sitter would violate the
+# frame's no-cross-package-imports rule. For these languages the edit is a small set of well-known
+# tokens, so a textual replacement is both sufficient and safer than a whole-file LLM rewrite: the
+# diff is minimal and cannot silently drop code.
+#
+# Every table was checked against that ecosystem's own reference documentation rather than written
+# from memory; the sources are cited per language. The result is also proved mechanically rather
+# than by inspection: `test_transform_coverage.py::test_weak_hash_swap_clears_the_finding` runs each
+# swap over a real fixture and then rescans the OUTPUT with QUBIT's own scanner, asserting the weak
+# algorithm is gone and SHA-256 is present. A swap that produced plausible-but-wrong code is caught
+# there, because the scanner reads all 19 of these languages.
+#
+# Deliberately hash-only. Cipher swaps are NOT safe as token replacements — DES->AES changes key
+# length from 8 to 32 bytes and the block size with it, so a naive swap compiles and then throws at
+# runtime. Those go to the LLM with explicit key/IV guidance instead.
+#
+# Entries are (pattern, replacement). A `str` pattern is a literal replacement; a compiled regex is
+# used where the edit depends on surrounding tokens — C# needs it because the *declared type* has to
+# change with the factory call, or `MD5 h = MD5.Create()` becomes `MD5 h = SHA256.Create()`, which
+# does not compile.
+#
+# Order matters within a table: longer, more specific patterns first, so a short one cannot corrupt
+# a longer token that contains it.
+_Swap = tuple[str | re.Pattern[str], str]
+
+_HASH_SWAPS: dict[str, tuple[_Swap, ...]] = {
+    # https://pkg.go.dev/crypto/sha256
+    "go": (
+        # crypto.Hash selector, used by rsa.SignPKCS1v15 / ecdsa.SignASN1.
+        ("crypto.SHA1", "crypto.SHA256"),
+        ("crypto.MD5", "crypto.SHA256"),
+        ("md5.New(", "sha256.New("),
+        ("md5.Sum(", "sha256.Sum256("),
+        ("sha1.New(", "sha256.New("),
+        ("sha1.Sum(", "sha256.Sum256("),
+        ('"crypto/md5"', '"crypto/sha256"'),
+        ('"crypto/sha1"', '"crypto/sha256"'),
+    ),
+    # https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/security/MessageDigest.html
+    # The standard algorithm name is "SHA-256"; "SHA256" unhyphenated is not a guaranteed alias.
+    "java": (
+        # JCA standard signature names. "ECDSA" on its own is documented as an ambiguous alias
+        # for SHA1withECDSA, so it is spelled out rather than left to the provider.
+        ('"SHA1withRSA"', '"SHA256withRSA"'),
+        ('"MD5withRSA"', '"SHA256withRSA"'),
+        ('"SHA1withECDSA"', '"SHA256withECDSA"'),
+        ('"SHA1withDSA"', '"SHA256withDSA"'),
+        ('MessageDigest.getInstance("MD5")', 'MessageDigest.getInstance("SHA-256")'),
+        ('MessageDigest.getInstance("SHA-1")', 'MessageDigest.getInstance("SHA-256")'),
+        ('MessageDigest.getInstance("SHA1")', 'MessageDigest.getInstance("SHA-256")'),
+        # Apache Commons Codec — the most common third-party spelling.
+        ("DigestUtils.md5Hex(", "DigestUtils.sha256Hex("),
+        ("DigestUtils.sha1Hex(", "DigestUtils.sha256Hex("),
+        ("DigestUtils.md5(", "DigestUtils.sha256("),
+        ("DigestUtils.sha1(", "DigestUtils.sha256("),
+    ),
+    # https://nodejs.org/api/crypto.html#cryptocreatehashalgorithm-options
+    "javascript": (
+        ("createHash('md5')", "createHash('sha256')"),
+        ('createHash("md5")', 'createHash("sha256")'),
+        ("createHash('sha1')", "createHash('sha256')"),
+        ('createHash("sha1")', 'createHash("sha256")'),
+        # WebCrypto: https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/digest
+        ("digest('SHA-1'", "digest('SHA-256'"),
+        ('digest("SHA-1"', 'digest("SHA-256"'),
+    ),
+    # https://www.openssl.org/docs/man3.0/man3/EVP_sha256.html
+    "c": (
+        ("EVP_md5()", "EVP_sha256()"),
+        ("EVP_sha1()", "EVP_sha256()"),
+    ),
+    # C++ adds the Qt, Crypto++ and Botan spellings on top of the OpenSSL ones.
+    # https://doc.qt.io/qt-6/qcryptographichash.html  -> QCryptographicHash::Sha256
+    # https://cryptopp.com/wiki/SHA2                  -> CryptoPP::SHA256 (MD5 lives in ::Weak)
+    # https://botan.randombit.net/handbook/api_ref/hash.html
+    "cpp": (
+        ("EVP_md5()", "EVP_sha256()"),
+        ("EVP_sha1()", "EVP_sha256()"),
+        ("QCryptographicHash::Md5", "QCryptographicHash::Sha256"),
+        ("QCryptographicHash::Sha1", "QCryptographicHash::Sha256"),
+        ("CryptoPP::Weak1::MD5", "CryptoPP::SHA256"),
+        ("CryptoPP::Weak::MD5", "CryptoPP::SHA256"),
+        ("CryptoPP::SHA1", "CryptoPP::SHA256"),
+        ("Weak1::MD5", "SHA256"),
+        ("Weak::MD5", "SHA256"),
+        ('HashFunction::create_or_throw("MD5")', 'HashFunction::create_or_throw("SHA-256")'),
+        ('HashFunction::create_or_throw("SHA-1")', 'HashFunction::create_or_throw("SHA-256")'),
+        ('HashFunction::create("MD5")', 'HashFunction::create("SHA-256")'),
+        ('HashFunction::create("SHA-1")', 'HashFunction::create("SHA-256")'),
+    ),
+    # https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.sha256
+    # `SHA256.Create()` is the factory, `SHA256.HashData(...)` the one-shot. The declared type has
+    # to move with the factory call: `using (MD5 h = MD5.Create())` must become
+    # `using (SHA256 h = SHA256.Create())`, so the type position needs a regex.
+    "csharp": (
+        # Signature digest selector.
+        ("HashAlgorithmName.SHA1", "HashAlgorithmName.SHA256"),
+        ("HashAlgorithmName.MD5", "HashAlgorithmName.SHA256"),
+        (
+            re.compile(r"\bnew\s+(?:MD5|SHA1)(?:CryptoServiceProvider|Managed|Cng)\s*\(\s*\)"),
+            "SHA256.Create()",
+        ),
+        (re.compile(r"\b(?:MD5|SHA1)\.Create\s*\(\s*\)"), "SHA256.Create()"),
+        (re.compile(r"\b(?:MD5|SHA1)\.HashData\s*\("), "SHA256.HashData("),
+        # Name-based construction. Only the LITERAL form is swapped:
+        # `HashAlgorithm.Create(algo)` where `algo` is a variable holding "MD5" is left alone,
+        # because rewriting that variable's initialiser is not safe from one call site — the
+        # variable may be read elsewhere. Those findings survive the patch, and the rescan stage
+        # then correctly reports it as incomplete rather than claiming the file is clean.
+        (re.compile(r'HashAlgorithm\.Create\s*\(\s*"(?:MD5|SHA1)"\s*\)'), "SHA256.Create()"),
+        (re.compile(r'CryptoConfig\.CreateFromName\s*\(\s*"(?:MD5|SHA1)"\s*\)'), "SHA256.Create()"),
+        (re.compile(r"\b(?:MD5|SHA1)(?:CryptoServiceProvider|Managed|Cng)\b"), "SHA256"),
+        # Declared-type position: `MD5 hasher`, `SHA1 h`.
+        (re.compile(r"\b(?:MD5|SHA1)\b(?=\s+[A-Za-z_])"), "SHA256"),
+    ),
+    # https://www.php.net/manual/en/function.hash.php
+    # `hash(string $algo, string $data, bool $binary = false)`; `md5(string $string,
+    # bool $binary = false)`. Rewriting the call head to `hash('sha256', ` therefore preserves an
+    # optional second argument exactly: md5($x, true) -> hash('sha256', $x, true).
+    "php": (
+        # Signature digests. `openssl_sign($d, $s, $k, OPENSSL_ALGO_SHA1)` is a SHA-1 finding
+        # with usage_context=signature; the fix is to sign with SHA-256.
+        ("OPENSSL_ALGO_SHA1", "OPENSSL_ALGO_SHA256"),
+        ("OPENSSL_ALGO_MD5", "OPENSSL_ALGO_SHA256"),
+        ("OPENSSL_ALGO_MD4", "OPENSSL_ALGO_SHA256"),
+        ("OPENSSL_ALGO_RMD160", "OPENSSL_ALGO_SHA256"),
+        ("hash('md5'", "hash('sha256'"),
+        ('hash("md5"', 'hash("sha256"'),
+        ("hash('sha1'", "hash('sha256'"),
+        ('hash("sha1"', 'hash("sha256"'),
+        (re.compile(r"\bmd5_file\s*\("), "hash_file('sha256', "),
+        (re.compile(r"\bsha1_file\s*\("), "hash_file('sha256', "),
+        # Not preceded by -> or :: or $, so a method or property named md5() is left alone.
+        (re.compile(r"(?<![>:$\w])md5\s*\("), "hash('sha256', "),
+        (re.compile(r"(?<![>:$\w])sha1\s*\("), "hash('sha256', "),
+    ),
+    # https://docs.ruby-lang.org/en/3.3/Digest.html -> Digest::SHA256
+    # `Digest::MD5` is also the tail of `OpenSSL::Digest::MD5`, so one pattern covers both.
+    "ruby": (
+        ("Digest::MD5", "Digest::SHA256"),
+        ("Digest::SHA1", "Digest::SHA256"),
+        ("Digest.new('MD5')", "Digest.new('SHA256')"),
+        ('Digest.new("MD5")', 'Digest.new("SHA256")'),
+        ("Digest.new('SHA1')", "Digest.new('SHA256')"),
+        ('Digest.new("SHA1")', 'Digest.new("SHA256")'),
+    ),
+    # https://docs.rs/sha2  -> use sha2::{Sha256, Digest}; Sha256::new() / Sha256::digest(..)
+    # https://docs.rs/md-5  -> crate `md-5`, module `md5`, struct `Md5`
+    # This swaps one third-party crate for another, so `sha2` has to be a dependency. Cargo.toml is
+    # a different file than the one being patched — see HASH_SWAP_DEPENDENCY_NOTES, which the
+    # generated patch carries so the requirement is stated rather than discovered at build time.
+    "rust": (
+        ("use md5::{Md5, Digest}", "use sha2::{Sha256, Digest}"),
+        ("use md5::{Digest, Md5}", "use sha2::{Digest, Sha256}"),
+        ("use sha1::{Sha1, Digest}", "use sha2::{Sha256, Digest}"),
+        ("use sha1::{Digest, Sha1}", "use sha2::{Digest, Sha256}"),
+        ("use md5::Md5", "use sha2::Sha256"),
+        ("use sha1::Sha1", "use sha2::Sha256"),
+        ("md5::Md5", "sha2::Sha256"),
+        ("sha1::Sha1", "sha2::Sha256"),
+        # The `openssl` crate names digests through a factory, and `ring` spells SHA-1 with the
+        # warning baked into the constant. Both appear in real Rust services; neither was covered
+        # until the validator's rescan stage failed on `seal.rs` in the polyglot corpus.
+        ("MessageDigest::md5()", "MessageDigest::sha256()"),
+        ("MessageDigest::sha1()", "MessageDigest::sha256()"),
+        ("digest::SHA1_FOR_LEGACY_USE_ONLY", "digest::SHA256"),
+        ("SHA1_FOR_LEGACY_USE_ONLY", "SHA256"),
+        ("Md5::new(", "Sha256::new("),
+        ("Md5::digest(", "Sha256::digest("),
+        ("Sha1::new(", "Sha256::new("),
+        ("Sha1::digest(", "Sha256::digest("),
+    ),
+    # Kotlin and Scala both reach the JCA, so they use Java's standard algorithm names.
+    "kotlin": (
+        ('"SHA1withRSA"', '"SHA256withRSA"'),
+        ('"MD5withRSA"', '"SHA256withRSA"'),
+        ('"SHA1withECDSA"', '"SHA256withECDSA"'),
+        ('"SHA1withDSA"', '"SHA256withDSA"'),
+        ('MessageDigest.getInstance("MD5")', 'MessageDigest.getInstance("SHA-256")'),
+        ('MessageDigest.getInstance("SHA-1")', 'MessageDigest.getInstance("SHA-256")'),
+        ('MessageDigest.getInstance("SHA1")', 'MessageDigest.getInstance("SHA-256")'),
+    ),
+    "scala": (
+        ('"SHA1withRSA"', '"SHA256withRSA"'),
+        ('"MD5withRSA"', '"SHA256withRSA"'),
+        ('"SHA1withECDSA"', '"SHA256withECDSA"'),
+        ('"SHA1withDSA"', '"SHA256withDSA"'),
+        ('MessageDigest.getInstance("MD5")', 'MessageDigest.getInstance("SHA-256")'),
+        ('MessageDigest.getInstance("SHA-1")', 'MessageDigest.getInstance("SHA-256")'),
+        ('MessageDigest.getInstance("SHA1")', 'MessageDigest.getInstance("SHA-256")'),
+    ),
+    # https://developer.apple.com/documentation/cryptokit/insecure
+    # CryptoKit files MD5/SHA1 under `Insecure`; the secure form drops the prefix entirely.
+    # CommonCrypto's digest LENGTH constant must move with the function, or a 32-byte digest is
+    # written into a 16/20-byte buffer — a stack overwrite, not a wrong answer. The constants are
+    # listed first so the shorter function-name swap cannot corrupt them.
+    "swift": (
+        # SecKeyAlgorithm signature selectors.
+        (".rsaSignatureMessagePKCS1v15SHA1", ".rsaSignatureMessagePKCS1v15SHA256"),
+        (".ecdsaSignatureMessageX962SHA1", ".ecdsaSignatureMessageX962SHA256"),
+        ("CC_MD5_DIGEST_LENGTH", "CC_SHA256_DIGEST_LENGTH"),
+        ("CC_SHA1_DIGEST_LENGTH", "CC_SHA256_DIGEST_LENGTH"),
+        ("Insecure.MD5", "SHA256"),
+        ("Insecure.SHA1", "SHA256"),
+        ("CC_MD5(", "CC_SHA256("),
+        ("CC_SHA1(", "CC_SHA256("),
+    ),
+    # https://pub.dev/packages/crypto -> top-level `sha256` constant, `.convert(bytes)`
+    # https://pub.dev/documentation/pointycastle/latest/ -> digests named by string
+    "dart": (
+        # PointyCastle signers name the digest and the scheme together.
+        ("Signer('SHA-1/RSA')", "Signer('SHA-256/RSA')"),
+        ('Signer("SHA-1/RSA")', 'Signer("SHA-256/RSA")'),
+        ("Signer('MD5/RSA')", "Signer('SHA-256/RSA')"),
+        ("md5.convert(", "sha256.convert("),
+        ("sha1.convert(", "sha256.convert("),
+        ("Digest('MD5')", "Digest('SHA-256')"),
+        ('Digest("MD5")', 'Digest("SHA-256")'),
+        ("Digest('SHA-1')", "Digest('SHA-256')"),
+        ('Digest("SHA-1")', 'Digest("SHA-256")'),
+    ),
+    # Coreutils / OpenSSL command names. `shasum -a 1` is the macOS spelling.
+    "bash": (
+        ("openssl dgst -md5", "openssl dgst -sha256"),
+        ("openssl dgst -sha1", "openssl dgst -sha256"),
+        (re.compile(r"\bopenssl\s+md5\b"), "openssl sha256"),
+        (re.compile(r"\bopenssl\s+sha1\b"), "openssl sha256"),
+        (re.compile(r"\bmd5sum\b"), "sha256sum"),
+        (re.compile(r"\bsha1sum\b"), "sha256sum"),
+        (re.compile(r"\bshasum\s+-a\s+1\b"), "shasum -a 256"),
+    ),
+    # https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/get-filehash
+    # PowerShell is case-insensitive, so the parameter match has to be too.
+    "powershell": (
+        (re.compile(r"-Algorithm\s+(?:MD5|SHA1)\b", re.IGNORECASE), "-Algorithm SHA256"),
+        ("[System.Security.Cryptography.MD5]", "[System.Security.Cryptography.SHA256]"),
+        ("[System.Security.Cryptography.SHA1]", "[System.Security.Cryptography.SHA256]"),
+        ("[Security.Cryptography.MD5]", "[Security.Cryptography.SHA256]"),
+        ("[Security.Cryptography.SHA1]", "[Security.Cryptography.SHA256]"),
+    ),
+    # SQL is dialect-specific, so only forms whose replacement is unambiguous are swapped:
+    #   PostgreSQL pgcrypto  digest(data, 'md5')    -> digest(data, 'sha256')
+    #   T-SQL                HASHBYTES('MD5', data) -> HASHBYTES('SHA2_256', data)
+    # MySQL's `MD5(x)` is deliberately NOT swapped: its replacement `SHA2(x, 256)` changes the
+    # call's arity, which a token swap cannot do correctly. Those findings keep no codemod and stay
+    # manual, which is the honest outcome — the rule's semantic_note says so.
+    "sql": (
+        (re.compile(r"(digest\s*\([^,()]*,\s*)'md5'", re.IGNORECASE), r"\1'sha256'"),
+        (re.compile(r'(digest\s*\([^,()]*,\s*)"md5"', re.IGNORECASE), r'\1"sha256"'),
+        (re.compile(r"(digest\s*\([^,()]*,\s*)'sha1'", re.IGNORECASE), r"\1'sha256'"),
+        (re.compile(r"(HASHBYTES\s*\(\s*)'MD5'", re.IGNORECASE), r"\1'SHA2_256'"),
+        (re.compile(r'(HASHBYTES\s*\(\s*)"MD5"', re.IGNORECASE), r'\1"SHA2_256"'),
+        (re.compile(r"(HASHBYTES\s*\(\s*)'SHA1'", re.IGNORECASE), r"\1'SHA2_256'"),
+    ),
+}
+_HASH_SWAPS["typescript"] = _HASH_SWAPS["javascript"]
+_HASH_SWAPS["tsx"] = _HASH_SWAPS["javascript"]
+
+#: Languages whose swap trades one third-party package for a different one, so the source edit is
+#: incomplete until the manifest is updated too. Carried on the generated patch rather than left for
+#: the build to discover.
+HASH_SWAP_DEPENDENCY_NOTES: dict[str, str] = {
+    "rust": (
+        "Add `sha2` to [dependencies] in Cargo.toml. This swap replaces the `md-5` / `sha1` crates "
+        "with `sha2`, which is a different dependency — the edited file will not build until it is "
+        "declared."
+    ),
+}
+
+
+def _is_import_swap(pattern: str | re.Pattern[str]) -> bool:
+    """Does this swap rewrite a module/package reference rather than a call site?
+
+    Import swaps have to be treated separately from usage swaps, because they are the one kind
+    whose correct scope is the whole file: Go will not compile a file that imports `crypto/sha1`
+    and never calls it, so rewriting a `sha1.New()` on one line while leaving the import alone
+    produces a patch that fails `compiles` -- and rewriting the import while another line still
+    calls `sha1.Sum` produces one that fails just as hard in the other direction.
+    """
+    text = pattern if isinstance(pattern, str) else pattern.pattern
+    lowered = text.lower()
+    return (
+        lowered.startswith(('"crypto/', "'crypto/", '"golang.org/', "require(", "require '"))
+        or lowered.startswith(("import ", "from ", "use ", "#include"))
+        or ("/" in text and text.startswith(('"', "'")))
+    )
+
+
+def _apply_hash_swap(source: str, language: str, only_line: int | None = None) -> tuple[str, bool]:
+    """Replace weak-hash constructors with SHA-256 for a non-Python language.
+
+    Returns ``(new_source, changed)``. ``changed`` is False when the language has no table *or* when
+    nothing matched — the caller turns that into "no patch" rather than an empty diff, which is what
+    stops a rule from reporting success on a file it never touched.
+
+    **Scoped to ``only_line`` when one is given.** This function used to rewrite every match in the
+    file, which the registry entry has described as a "line-scoped token swap" since long before it
+    was one. A task owns exactly ONE finding, and the other occurrences of the same algorithm in the
+    same file are other tasks with their own dispositions — several of which are deliberate
+    refusals. Measured on the Ruby twin, through the desktop app: one patch rewrote all five SHA-1
+    call sites in `crypto/documents.rb`, four of which the manifest marks REFUSE (a persisted
+    content address, the digest signatures commit to, a certificate thumbprint owned by a CA, and a
+    de-duplication key). Every syntactic gate passed it, and the twin's own suite went red.
+
+    Imports are the exception and are handled file-wide, because their correct scope genuinely is
+    the file — see `_is_import_swap`. An import is REPLACED only once the old module has no callers
+    left; while another line still uses it, the new module is added ALONGSIDE, so neither an unused
+    import nor a missing one can reach `compiles`.
+    """
+    swaps = _HASH_SWAPS.get(language, ())
+    if not swaps:
+        return source, False
+
+    usage = tuple((p, r) for p, r in swaps if not _is_import_swap(p))
+    imports = tuple((p, r) for p, r in swaps if _is_import_swap(p))
+
+    def swap_all(text: str, table: tuple[_Swap, ...]) -> str:
+        for pattern, replacement in table:
+            if isinstance(pattern, str):
+                text = text.replace(pattern, replacement)
+            else:
+                text = pattern.sub(replacement, text)
+        return text
+
+    if only_line is None:
+        return (lambda out: (out, out != source))(swap_all(source, swaps))
+
+    lines = source.splitlines(keepends=True)
+    if not 1 <= only_line <= len(lines):
+        # A line outside the file means the caller's asset and the file on disk disagree. Swapping
+        # the whole file "just in case" is how a refusal turns into a migration, so do nothing.
+        return source, False
+
+    index = only_line - 1
+    rewritten = swap_all(lines[index], usage)
+    if rewritten == lines[index]:
+        return source, False
+    lines[index] = rewritten
+
+    # Now the imports, in the light of what the file still calls.
+    #
+    # Every decision below is made against the CURRENT `lines`, never against `source`. A file that
+    # imports both `crypto/md5` and `crypto/sha1` has two import swaps to make, and a run that
+    # decides each one against the original text replaces both with `crypto/sha256` -- so does a
+    # second task patching a file the first already migrated. Measured on sentinel-idp: three files
+    # came out with two and three `"crypto/sha256"` lines each, and the package did not build
+    # (`sha256 redeclared in this block`). Every syntactic gate except `compiles` passed them.
+    drop: set[int] = set()
+    for pattern, replacement in imports:
+        if not isinstance(pattern, str) or not any(pattern in ln for ln in lines):
+            continue
+        old_module = _module_alias(pattern)
+        new_module = _module_alias(replacement)
+        body = "".join(
+            ln for i, ln in enumerate(lines) if i not in drop and not _looks_like_import(ln)
+        )
+        still_used = bool(old_module) and f"{old_module}." in body
+        current = "".join(ln for i, ln in enumerate(lines) if i not in drop)
+        already_imported = replacement in current
+
+        for i, line in enumerate(lines):
+            if i in drop or pattern not in line:
+                continue
+            if still_used:
+                # Another call site keeps the old module alive, so it stays. Add the new one only
+                # if something actually calls it and it is not already there.
+                if new_module and f"{new_module}." not in current:
+                    continue
+                if not already_imported:
+                    lines[i] = line + line.replace(pattern, replacement)
+                    already_imported = True
+            elif already_imported:
+                # The old module has no callers left and the new one is already imported, so this
+                # line is now redundant. Rewriting it in place is what produced the duplicates.
+                drop.add(i)
+            else:
+                lines[i] = line.replace(pattern, replacement)
+                already_imported = True
+
+    out = "".join(ln for i, ln in enumerate(lines) if i not in drop)
+    return out, out != source
+
+
+def _module_alias(token: str) -> str:
+    """`"crypto/sha1"` -> `sha1`: the name a Go import is referred to by at its call sites."""
+    return token.strip("\"'").rsplit("/", 1)[-1] if "/" in token else ""
+
+
+def _looks_like_import(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith(("import ", "from ", "require ", "use ", "#include")) or (
+        stripped.startswith(('"', "'")) and "/" in stripped
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registry + public API
+# ---------------------------------------------------------------------------
+
+# Name -> callable(source, asset, file_path) -> (new_source, changed). Keeping this a real dispatch
+# table (rather than the if-chain this used to be) is what lets a new rule ship as YAML + one
+# function instead of editing run_codemod every time.
+_CODEMOD_REGISTRY: dict[str, str] = {
+    "weakhash_to_argon2_or_sha256": "python weak hash -> argon2id (passwords) or SHA-256",
+    "weakhash_to_sha256": "non-Python weak hash -> SHA-256 (line-scoped token swap)",
+    "harden_tls_config": "nginx/Apache/OpenSSH -> hybrid-PQC, AEAD-only posture",
+    "bump_crypto_dependency": "manifest pin -> a version that provides PQC primitives",
+    "add_pqc_dependency": "manifest -> declares a PQC provider (or raises go.mod's go directive)",
+}
+
+
+def run_codemod(
+    codemod_name: str,
+    asset: CryptoAsset,
+    file_path: Path,
+    *,
+    language: str | None = None,
+) -> tuple[str, str] | None:
+    """Run a deterministic codemod on ``file_path``.
+
+    Returns (original_source, new_source) or None if codemod not applicable.
+    Raises KeyError if codemod name is not registered.
+    """
+    if codemod_name not in _CODEMOD_REGISTRY:
+        raise KeyError(f"Unknown codemod: {codemod_name!r}")
+
+    if codemod_name == "harden_tls_config":
+        # Config hardening reads the file itself (format is chosen by name/content).
+        return harden_config_file(file_path)
+
+    source = file_path.read_text(encoding="utf-8", errors="replace")
+
+    if codemod_name == "weakhash_to_argon2_or_sha256":
+        # Deferred: this is the only codemod needing libcst (~0.25s to import), and importing
+        # this module is unavoidable for every `qubit` invocation because the migrate CLI sub-app
+        # pulls it in at registration. See transform/libcst_codemods.py.
+        from .libcst_codemods import apply_weakhash_codemod
+
+        new_source, changed = apply_weakhash_codemod(source, asset)
+    elif codemod_name == "weakhash_to_sha256":
+        # Derived from the file extension when not supplied, so callers (the orchestrator) do not
+        # need to know the language to run a codemod.
+        lang = (language or _SUFFIX_TO_LANGUAGE.get(file_path.suffix.lower(), "")).lower()
+        # The asset's own line, so this swap touches THIS finding and not its neighbours. The
+        # Python codemod has been scoped this way since `apply_weakhash_codemod` grew `only_line`;
+        # this path was still rewriting whole files.
+        new_source, changed = _apply_hash_swap(
+            source, lang, asset.location.line if asset.location else None
+        )
+    elif codemod_name == "bump_crypto_dependency":
+        new_source, changed = _apply_dependency_bump(source, file_path.name.lower())
+    elif codemod_name == "add_pqc_dependency":
+        new_source, changed = _apply_add_pqc_dependency(source, file_path.name.lower())
+    else:  # pragma: no cover - registry and dispatch are kept in sync by test_codemod_registry
+        return None
+
+    return (source, new_source) if changed else None
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+__all__ = ["_CODEMOD_REGISTRY", "file_sha256", "run_codemod"]

@@ -1,0 +1,355 @@
+from __future__ import annotations
+
+import pytest
+from qubit_core import algorithms
+from qubit_core.schemas import QuantumAttack
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("RSA-2048", "RSA-2048"),
+        ("rsa2048", "RSA-2048"),
+        ("RSA/2048", "RSA-2048"),
+        ("rsa_2048", "RSA-2048"),
+        ("Kyber768", "ML-KEM-768"),
+        ("mlkem768", "ML-KEM-768"),
+        ("prime256v1", "ECDSA-P256"),
+        ("des", "DES"),
+        ("DES", "DES"),
+        ("x25519mlkem768", "X25519MLKEM768"),
+        # JOSE/JWT alg identifiers (RFC 7518) — added to ground the Go/JS JWT rule packs.
+        ("es256", "ECDSA-P256"),
+        ("es384", "ECDSA-P384"),
+        ("es512", "ECDSA-P521"),
+        ("eddsa", "Ed25519"),
+        ("RS256", "RS256"),
+        ("ps256", "PS256"),
+        ("HS256", "HS256"),
+        ("hmac-sha384", "HS384"),
+    ],
+)
+def test_resolve_aliases(raw: str, expected: str) -> None:
+    got = algorithms.resolve(raw)
+    assert got is not None and got.canonical == expected
+
+
+def test_jose_alg_quantum_verdicts() -> None:
+    # RSA-signature and ECDSA-based JOSE algs are Shor-broken.
+    for name in ("RS256", "PS256", "ES256", "ES512", "EdDSA"):
+        entry = algorithms.resolve(name)
+        assert entry is not None, name
+        assert entry.vulnerable is True and entry.attack is QuantumAttack.shor, name
+
+    # The HMAC algs are quantum-SAFE, and this assertion was inverted until 2026-08-16. Grover only
+    # halves symmetric strength, so an HMAC-SHA-256 key leaves 128 bits — the same reasoning that
+    # makes AES-256 and SHA-256 `_safe` here, and HMAC is strictly stronger than the hash it wraps.
+    # Rating HS256 vulnerable while rating SHA-256 safe contradicted itself, and it had a real
+    # consequence: every HMAC variant was flagged, HS512 included, so an HMAC finding had no safe
+    # target to migrate TO and could never be cleared. CNSA 2.0 approves HMAC-SHA-384.
+    for name in ("HS256", "HS384", "HS512"):
+        entry = algorithms.resolve(name)
+        assert entry is not None, name
+        assert entry.vulnerable is False and entry.attack is QuantumAttack.none, name
+
+    # Built on a classically broken hash, so still flagged — on the hash, not on Grover.
+    for name in ("hmac-sha1", "hmac-md5"):
+        entry = algorithms.resolve(name)
+        assert entry is not None and entry.vulnerable is True, name
+
+
+def test_resolve_rsa_by_key_size() -> None:
+    got = algorithms.resolve("rsa", key_size=4096)
+    assert got is not None and got.canonical == "RSA-4096"
+
+
+def test_quantum_verdicts() -> None:
+    assert algorithms.get("RSA-2048").attack is QuantumAttack.shor  # type: ignore[union-attr]
+    assert algorithms.get("ML-KEM-768").vulnerable is False  # type: ignore[union-attr]
+    assert algorithms.get("AES-128").attack is QuantumAttack.grover  # type: ignore[union-attr]
+    assert algorithms.get("AES-256").vulnerable is False  # type: ignore[union-attr]
+
+
+def test_bare_public_key_family_stays_shor_vulnerable() -> None:
+    # a size-less "RSA" (Cipher.getInstance("RSA"), JWT RS256) must NOT degrade to safe/unknown
+    rsa = algorithms.resolve("RSA")
+    assert rsa is not None and rsa.canonical == "RSA"
+    assert rsa.vulnerable is True and rsa.attack is QuantumAttack.shor
+    ec = algorithms.resolve("EC")
+    assert ec is not None and ec.attack is QuantumAttack.shor
+
+
+def test_size_wins_over_bare_family() -> None:
+    # explicit key size must still parameterize even though a bare "RSA" entry now exists
+    assert algorithms.resolve("RSA", key_size=3072).canonical == "RSA-3072"  # type: ignore[union-attr]
+    assert algorithms.resolve("RSA-2048").canonical == "RSA-2048"  # type: ignore[union-attr]
+
+
+def test_unknown_returns_none() -> None:
+    assert algorithms.resolve("totally-made-up-cipher") is None
+    assert algorithms.resolve("") is None
+
+
+# ---------------------------------------------------------------------------
+# OpenSSL-spelled cipher suites (nginx `ssl_ciphers` / Apache `SSLCipherSuite`)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "suite,expected",
+    [
+        # ECDHE-prefixed: the key exchange governs harvest-now-decrypt-later exposure.
+        ("ECDHE-RSA-AES128-GCM-SHA256", "ECDH-P256"),
+        ("ECDHE-ECDSA-CHACHA20-POLY1305", "ECDH-P256"),
+        ("ECDHE-RSA-AES128-SHA", "ECDH-P256"),
+        ("DHE-RSA-AES256-SHA", "DH"),
+        # No kex prefix is OpenSSL's spelling for static RSA key transport - no forward secrecy at
+        # all, so one recovered RSA key opens every recorded session. These are the worst suites for
+        # HNDL and they must not come back unresolved.
+        ("AES128-SHA", "RSA"),
+        ("DES-CBC3-SHA", "RSA"),
+        ("RC4-MD5", "RSA"),
+    ],
+)
+def test_openssl_cipher_suite_names_resolve(suite: str, expected: str) -> None:
+    """Real nginx and Apache configs use OpenSSL's hyphenated suite spelling, not the IANA
+    `TLS_..._WITH_...` form. Until these resolved, every `ssl_ciphers` line in every real config
+    became `UNKNOWN(...)`, which `normalize()` rates NOT vulnerable - so a server pinned to
+    `ECDHE-RSA-AES128-SHA` was reported clean."""
+    resolved = algorithms.resolve(suite)
+    assert resolved is not None, f"{suite} did not resolve"
+    assert resolved.canonical == expected
+    assert resolved.vulnerable, f"{suite} resolved to {expected} but is rated not vulnerable"
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("aes-128-cbc", "AES-128"),
+        ("aes-256-gcm", "AES-256"),
+        ("des-ede3-cbc", "3DES"),
+        ("chacha20-poly1305", "ChaCha20-Poly1305"),
+        ("hmac-sha256", "HS256"),
+        ("DESede/CBC/PKCS5Padding", "3DES"),
+    ],
+)
+def test_plain_cipher_strings_are_not_hijacked_by_suite_reduction(name: str, expected: str) -> None:
+    """The OpenSSL suite reducer runs LAST in `resolve()` precisely so it cannot pre-empt an
+    ordinary cipher string. `aes-128-cbc` is a cipher, not a suite, and must stay AES-128."""
+    resolved = algorithms.resolve(name)
+    assert resolved is not None and resolved.canonical == expected
+
+
+def test_null_cipher_is_flagged_rather_than_reported_safe() -> None:
+    """A NULL cipher is plaintext on the wire. No quantum attack is involved, but reporting it as
+    "not vulnerable" would be badly misleading - it is already harvested, no CRQC needed."""
+    resolved = algorithms.resolve("NULL")
+    assert resolved is not None
+    assert resolved.vulnerable
+
+
+def test_psk_suite_resolves_and_is_honestly_rated_quantum_safe() -> None:
+    """A PSK suite has no public-key key exchange, so there is nothing for Shor to factor - a long,
+    secret pre-shared key really is a quantum-safe stopgap. What matters is that it RESOLVES: as
+    `UNKNOWN(...)` it would also read as not-vulnerable, but for the wrong reason and with no way to
+    tell the two apart."""
+    resolved = algorithms.resolve("PSK-AES128-CBC-SHA")
+    assert resolved is not None and resolved.canonical == "PSK"
+    assert not resolved.vulnerable
+    assert resolved.attack is QuantumAttack.none
+
+
+def test_iana_psk_and_null_suites_no_longer_fall_through() -> None:
+    """`PSK` and `NULL` were named by the IANA suite-reduction tables but never existed as registry
+    entries, so `TLS_PSK_WITH_*` reduced to a name nothing could resolve."""
+    assert algorithms.resolve("TLS_PSK_WITH_AES_128_CBC_SHA") is not None
+
+
+# ── X.509 signature-algorithm names ──────────────────────────────────────────────────────────────
+# These reached the registry from two real sources — the certificate scanner and Vault's PKI mount —
+# and none of them resolved. `normalize()` rates an unresolved name as UNKNOWN *and not vulnerable*,
+# so the signature algorithm of every RSA-signed certificate was reported quantum-safe. Found by
+# scanning a real seeded Vault and reading the asset list: `UNKNOWN(sha256WithRSAEncryption)`.
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_family"),
+    [
+        # RFC 3279 / 4055 — the spellings OpenSSL and Vault actually emit.
+        ("sha256WithRSAEncryption", "RSA"),
+        ("sha384WithRSAEncryption", "RSA"),
+        ("sha512WithRSAEncryption", "RSA"),
+        # Classically broken as well as Shor-broken; being rated "safe" was the worst case.
+        ("sha1WithRSAEncryption", "RSA"),
+        ("md5WithRSAEncryption", "RSA"),
+        ("rsassa-pss", "RSA"),
+        # RFC 5758 ECDSA spellings.
+        ("ecdsa-with-SHA256", "ECDSA"),
+        ("ecdsa-with-SHA384", "ECDSA"),
+        ("ecdsa-with-SHA512", "ECDSA"),
+        ("dsa-with-sha256", "DSA"),
+    ],
+)
+def test_x509_signature_algorithms_resolve_and_stay_vulnerable(
+    name: str, expected_family: str
+) -> None:
+    resolved = algorithms.resolve(name)
+    assert resolved is not None, f"{name} must resolve; UNKNOWN would be rated not-vulnerable"
+    assert resolved.family == expected_family
+    # The whole point: every one of these is signed with a Shor-broken key algorithm.
+    assert resolved.vulnerable is True
+    assert resolved.attack is QuantumAttack.shor
+
+
+def test_ecdsa_signature_name_does_not_invent_a_curve() -> None:
+    """`ecdsa-with-SHA384` names no curve, so reporting ECDSA-P256 would be a fabricated detail.
+
+    It also must not be reported as RSA. Before the fix it was: the name is hyphenated and ends in a
+    hash token, so `_openssl_suite_component` mistook it for a prefix-less OpenSSL cipher suite and
+    applied the "static RSA key transport" fallback — an ECDSA certificate confidently relabelled as
+    RSA, which is worse than an UNKNOWN because nothing looks wrong.
+    """
+    resolved = algorithms.resolve("ecdsa-with-SHA384")
+    assert resolved is not None
+    assert resolved.canonical == "ECDSA"
+    assert resolved.key_size is None
+    assert resolved.family != "RSA"
+
+
+def test_bare_ecdsa_still_resolves_to_p256() -> None:
+    """The curve-less ECDSA entry added for the X.509 path must not change existing resolution.
+
+    `resolve("ecdsa")` hits the alias table (step 3) long before the bare-family step, so it still
+    returns ECDSA-P256 exactly as it did — this pins that the new entry is additive.
+    """
+    assert algorithms.resolve("ecdsa").canonical == "ECDSA-P256"
+    assert algorithms.resolve("secp384r1").canonical == "ECDSA-P384"
+
+
+@pytest.mark.parametrize(
+    ("suite", "expected"),
+    [
+        ("ECDHE-RSA-AES128-SHA", "ECDH-P256"),
+        ("AES128-SHA", "RSA"),  # no kex prefix => static RSA key transport
+        ("DES-CBC3-SHA", "RSA"),
+        ("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "ECDH-P256"),
+        ("aes-256-gcm", "AES-256"),
+    ],
+)
+def test_cipher_suite_resolution_is_unaffected_by_the_x509_path(suite: str, expected: str) -> None:
+    """The `with` guard added to the OpenSSL-suite fallback must not break real suite names.
+
+    `TLS_ECDHE_RSA_WITH_...` is included deliberately: it contains "with", and is handled by the
+    IANA path well before the OpenSSL fallback the guard applies to.
+    """
+    resolved = algorithms.resolve(suite)
+    assert resolved is not None
+    assert resolved.canonical == expected
+
+
+class TestStandardisedParameterSets:
+    """A standardised algorithm that resolves to `UNKNOWN(...)` reads as a scanner failure.
+
+    ML-KEM and ML-DSA carried their parameter sets from the start; SLH-DSA and HQC did not, so
+    `Signature.getInstance("SLH-DSA-SHA2-128s")` -- a FIPS 205 name that BouncyCastle, liboqs and
+    OpenSSL 3.5 all emit in full -- inventoried as an unrecognised string. The bare family entries
+    stay, for APIs that name only the family.
+    """
+
+    @pytest.mark.parametrize(
+        "raw,canonical,category",
+        [
+            ("SLH-DSA-SHA2-128s", "SLH-DSA-SHA2-128s", 1),
+            ("SLH-DSA-SHA2-192f", "SLH-DSA-SHA2-192f", 3),
+            ("SLH-DSA-SHAKE-256f", "SLH-DSA-SHAKE-256f", 5),
+            ("HQC-128", "HQC-128", 1),
+            ("HQC-256", "HQC-256", 5),
+        ],
+    )
+    def test_parameter_sets_resolve_with_their_security_category(
+        self, raw: str, canonical: str, category: int
+    ) -> None:
+        entry = algorithms.resolve(raw)
+        assert entry is not None, f"{raw} is a standardised name and must resolve"
+        assert entry.canonical == canonical
+        assert entry.nist_quantum_security_level == category
+
+    @pytest.mark.parametrize(
+        "legacy,canonical",
+        [
+            ("SPHINCS+-SHA2-192f-simple", "SLH-DSA-SHA2-192f"),
+            ("sphincs+-shake-128s", "SLH-DSA-SHAKE-128s"),
+        ],
+    )
+    def test_pre_standard_sphincs_names_map_to_the_standard_one(
+        self, legacy: str, canonical: str
+    ) -> None:
+        """Code written before FIPS 205 spells it SPHINCS+; it is the same algorithm."""
+        entry = algorithms.resolve(legacy)
+        assert entry is not None and entry.canonical == canonical
+
+    @pytest.mark.parametrize("family", ["SLH-DSA", "HQC", "ML-KEM", "ML-DSA"])
+    def test_the_bare_family_still_resolves(self, family: str) -> None:
+        entry = algorithms.resolve(family)
+        assert entry is not None and entry.canonical == family
+
+    @pytest.mark.parametrize("raw", ["SLH-DSA-SHA2-128s", "HQC-192", "SPHINCS+-SHAKE-256s"])
+    def test_none_of_them_are_reported_as_quantum_vulnerable(self, raw: str) -> None:
+        entry = algorithms.resolve(raw)
+        assert entry is not None and not entry.vulnerable
+
+
+def test_an_ec_key_resolves_to_the_curve_it_actually_uses() -> None:
+    """Every EC key used to come back as P-256, whatever curve it was on.
+
+    `resolve("ECDSA", 384)` skipped the sizing step -- ECDSA was in neither family table -- fell
+    through to the alias index and returned `ECDSA-P256`, so a P-384 certificate was reported as
+    P-256 and a P-521 one was too. Found on NVIDIA's own agent-skill signing chain
+    (`skill.oms.sig`), which is secp384r1 end to end: all three certificates came back labelled
+    `ECDSA-P256` beside a `key_size` of 384 -- one asset described two contradictory ways in a
+    single row.
+
+    The Shor verdict was correct either way, so this is precision rather than a missed
+    vulnerability. It still matters: the curve drives the risk score and the ML-DSA parameter set
+    the migration targets, so a wrong curve is a wrong migration.
+    """
+    for size, curve in ((256, "P256"), (384, "P384"), (521, "P521")):
+        for family in ("ECDSA", "ECDH"):
+            resolved = algorithms.resolve(family, size)
+            assert resolved is not None
+            assert resolved.canonical == f"{family}-{curve}", (
+                f"{family} on a {size}-bit curve resolved to {resolved.canonical}"
+            )
+
+
+def test_a_curveless_ec_signature_algorithm_is_not_given_a_curve() -> None:
+    """`ecdsa-with-SHA384` names the signature algorithm and no curve at all, so reporting one
+    would invent a fact the certificate never stated.
+
+    What keeps it curve-less is `_x509_signature_component` consulting `_BARE_FAMILY` BEFORE the
+    alias index -- the reverse of the precedence everywhere else in `resolve`. Swap those two and
+    this comes back as `ECDSA-P256`. The curve-sizing step added for real EC keys never reaches
+    here, because the signature path returns first; this test is what proves that stays true.
+    """
+    resolved = algorithms.resolve("ecdsa-with-SHA384")
+
+    assert resolved is not None
+    assert resolved.canonical == "ECDSA", "the signature algorithm carries no curve"
+    assert resolved.vulnerable is True
+
+
+def test_an_unrecognised_curve_size_falls_through_rather_than_inventing_a_curve() -> None:
+    """Only P-256/384/521 are canonical here. A size outside that set (a brainpool or otherwise
+    unlisted curve) must behave exactly as it did before the sizing step existed, not resolve to
+    the nearest thing."""
+    resolved = algorithms.resolve("ECDSA", 999)
+
+    assert resolved is not None
+    assert resolved.canonical == "ECDSA-P256", "unchanged fall-through to the alias index"
+
+
+def test_named_curve_aliases_are_untouched_by_the_sizing_step() -> None:
+    """A name that already states its curve resolves on the alias index and must not be re-derived
+    from a key size -- secp256k1 and P-256 are both 256-bit and are not the same curve."""
+    assert algorithms.resolve("secp256k1").canonical == "ECDSA-secp256k1"
+    assert algorithms.resolve("secp384r1").canonical == "ECDSA-P384"

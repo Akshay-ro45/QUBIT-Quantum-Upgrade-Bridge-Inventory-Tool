@@ -1,0 +1,106 @@
+schema: qubit-rule/v1
+language: python
+library:
+  name: PyJWT
+  detect_imports: [jwt]
+rules:
+  - id: PY-JWT-RS256
+    title: PyJWT RS256 token signing/verification
+    match:
+      query: |
+        (call
+          function: (attribute object: (identifier) @obj attribute: (identifier) @meth)
+          arguments: (argument_list
+            (keyword_argument
+              name: (identifier) @kw
+              value: (string) @alg))) @call
+      where:
+        - { capture: obj, equals: jwt }
+        - { capture: meth, in: [encode, decode] }
+        - { capture: kw, equals: algorithm }
+        - { capture: alg, regex: '^[rubfRUBF]*["'']RS256["'']$' }
+    extract:
+      # The JOSE identifier itself, not the bare family — `RS256` is a canonical registry entry
+      # (qubit_core.algorithms), so an RS256-signed JWT normalizes identically whether it was found
+      # in Python, Go, JavaScript or TypeScript. Emitting bare `RSA` here would make the same
+      # finding look like a different asset depending on the language it came from.
+      algorithm: { literal: RS256 }
+    asset: { asset_type: algorithm-use, usage_context: token }
+    confidence: medium
+    examples:
+      positive:
+        - |
+          import jwt
+          token = jwt.encode(payload, private_key, algorithm="RS256")
+      negative:
+        - |
+          import jwt
+          token = jwt.encode(payload, secret, algorithm="HS256")
+
+  - id: PY-JWT-ES256
+    title: PyJWT ES256 token signing/verification
+    match:
+      query: |
+        (call
+          function: (attribute object: (identifier) @obj attribute: (identifier) @meth)
+          arguments: (argument_list
+            (keyword_argument
+              name: (identifier) @kw
+              value: (string) @alg))) @call
+      where:
+        - { capture: obj, equals: jwt }
+        - { capture: meth, in: [encode, decode] }
+        - { capture: kw, equals: algorithm }
+        - { capture: alg, regex: '^[rubfRUBF]*["'']ES256["'']$' }
+    extract:
+      algorithm: { literal: ES256 } # see the RS256 note above — JOSE identifier, not bare family
+    asset: { asset_type: algorithm-use, usage_context: token }
+    confidence: medium
+    examples:
+      positive:
+        - |
+          import jwt
+          token = jwt.encode(payload, ec_private_key, algorithm="ES256")
+      negative:
+        - |
+          import jwt
+          token = jwt.encode(payload, secret, algorithm="HS256")
+
+  # JWT signature verification turned off, or `none` accepted as an algorithm. Both are the
+  # classic JWT authentication bypass (CWE-347): the token is read and trusted without its
+  # signature being checked, so anyone who can construct a token is anyone they like.
+  #
+  # Matched on the whole call rather than a specific argument shape because callers spell it
+  # several ways - `options={"verify_signature": False}`, the older `verify=False`, and
+  # `algorithms=["none"]` - and all three mean the same thing. The regex is anchored on those
+  # exact spellings, so ordinary `jwt.decode(token, key, algorithms=["RS256"])` does not match.
+  - id: PY-JWT-VERIFICATION-DISABLED
+    title: jwt.decode with signature verification off or alg "none"
+    match:
+      query: |
+        (call
+          function: (attribute object: (identifier) @obj attribute: (identifier) @meth)) @call
+      where:
+        - { capture: obj, equals: jwt }
+        - { capture: meth, in: [decode, get_unverified_header] }
+        - capture: call
+          regex: '"verify_signature"\s*:\s*False|verify\s*=\s*False|["'']none["'']'
+    extract:
+      algorithm: { literal: UNRESOLVED }
+      jwt_verification:
+        from: call
+        resolve: jwt-verification
+    asset: { asset_type: algorithm-use, usage_context: token }
+    confidence: high
+    examples:
+      positive:
+        - |
+          import jwt
+          claims = jwt.decode(token, key, options={"verify_signature": False})
+        - |
+          import jwt
+          claims = jwt.decode(token, key, algorithms=["none"])
+      negative:
+        - |
+          import jwt
+          claims = jwt.decode(token, key, algorithms=["RS256"])

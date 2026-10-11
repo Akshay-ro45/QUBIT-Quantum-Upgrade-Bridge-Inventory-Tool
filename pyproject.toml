@@ -1,0 +1,116 @@
+[project]
+name = "qubit-workspace"
+version = "0.0.0"                 # placeholder; real versions live in each package (kept lockstep)
+description = "QUBIT — Quantum Upgrade Bridge & Inventory Tool (workspace root)"
+requires-python = ">=3.12,<3.14"  # risk engine pins <3.14 (pgmpy/torch); uv manages the interpreter
+license = "MIT"
+readme = "README.md"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+qubit-core = { workspace = true }
+qubit-scanner = { workspace = true }
+qubit-risk = { workspace = true }
+qubit-migrate = { workspace = true }
+qubit-bridge = { workspace = true }
+qubit-api = { workspace = true }
+qubit-cli = { workspace = true }
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "pytest-xdist>=3.6",
+  "hypothesis>=6.115",
+  "mypy>=1.13",
+  "ruff>=0.8",
+  "pre-commit>=4",
+  "poethepoet>=0.30",
+  "httpx>=0.28",
+  "testcontainers>=4.5",
+  "pip-licenses>=5",
+  # Process and CPU inspection for the performance harness. Without it the harness cannot
+  # tell a quiet machine from a busy one, and a timing number taken under contention is
+  # worse than no timing number at all.
+  "psutil>=6",
+  # The XGBoost regressor's tests (doc 02 §6.4) must run in the gate, not skip — the project
+  # mandate is zero skips. Only these two of qubit-risk's `ml` extra are needed for that; torch/
+  # transformers (the DistilBERT sensitivity classifier) stay opt-in via `--extra ml` since they
+  # are ~2.5 GB and their tests synthesize rather than train.
+  "xgboost>=2.0",
+  "scikit-learn>=1.4",
+  # PDF report generation (qubit-core's `pdf` extra). Same reasoning as xgboost above: its tests must
+  # run in the gate rather than skip, and reportlab is pure Python with no system libraries.
+  "reportlab>=4.2",
+  # Reads the generated PDF back so the test asserts on RENDERED TEXT, not just that bytes were
+  # written. A hand-rolled zlib/regex extraction found nothing in a perfectly valid document, which
+  # is exactly the sort of false negative a real parser avoids.
+  "pypdf>=5.1",
+  # Every figure in paper_evidence/ is drawn with it. It was previously installed ad hoc,
+  # which meant the pack's "regenerate with one command" claim failed on a fresh checkout --
+  # the one place a reproducibility claim must not be wrong.
+  "matplotlib>=3.9",
+  # CryptoAPI-Bench publishes its ground truth as an .xlsx. It is converted ONCE into a
+  # checked-in CSV so the scoring harness reads an auditable text file rather than
+  # re-parsing a spreadsheet on every run.
+  "openpyxl>=3.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["unwanted", "docs", "**/tests/fixtures"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S", "PTH", "RUF"]
+ignore = ["S101"]                                       # assert is fine in tests
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S", "SIM"]
+"demo-lab/**" = ["S"]                                   # demo-lab is deliberately vulnerable
+# QUBIT legitimately orchestrates subprocesses (qubit CLI, git, openssl, nginx -t, docker) with
+# controlled args — S603/S607 are intended there, not injection risks. The evaluation harness in
+# scripts/ does the identical thing (git clone, docker run against a pinned sandbox image) for the
+# identical reason.
+"packages/qubit-migrate/**" = ["S603", "S607"]
+"scripts/**" = ["S603", "S607"]
+"packages/qubit-bridge/**" = ["S603", "S607", "S110"]
+"packages/qubit-cli/src/qubit_cli/commands/demo.py" = ["S603", "S607"]
+# scanners intentionally swallow parse errors per-file (best-effort discovery, never abort a scan).
+"packages/qubit-scanner/**" = ["S110"]
+# Typer routes options through call-in-default-arg by design.
+"**/cli.py" = ["B008"]
+# Sensitivity-classifier data synthesis: random is for reproducible sampling (not crypto);
+# vocab holds literal multi-language code templates that must stay verbatim.
+"packages/qubit-risk/src/qubit_risk/ml/synth.py" = ["S311"]
+"packages/qubit-risk/src/qubit_risk/ml/vocab.py" = ["E501"]
+# regressor label synthesis: random is for reproducible sampling of synthetic assets, not crypto.
+"packages/qubit-risk/src/qubit_risk/regressor/labels.py" = ["S311"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false                                          # per-package; qubit-core sets strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+markers = [
+  "integration: needs docker",
+  "llm: needs live Ollama",
+  "online: needs internet",
+  "slow: >30s",
+]
+testpaths = ["packages"]
+
+[tool.coverage.run]
+source = ["qubit_core", "qubit_scanner", "qubit_risk"]  # frame coverage-gate scope (3 core packages)
+branch = true
+
+[tool.poe.tasks]
+fmt = "ruff format ."
+lint = "ruff check ."
+type = "mypy packages/qubit-core/src"
+unit = "pytest -m 'not integration and not llm and not online'"
+integ = "pytest -m integration"
+check = ["fmt", "lint", "type", "unit"]

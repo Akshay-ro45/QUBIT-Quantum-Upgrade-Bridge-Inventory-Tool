@@ -1,0 +1,172 @@
+"""E1 — Per-asset algorithm recommendation endpoint (doc 08 §2, E1).
+
+GET /assets/{aid}/recommendation
+  Returns an AssetRecommendation: target algorithm, library requirement, rationale,
+  and provenance (rule | kb | agility-policy).
+
+Resolution priority:
+  1. migration rule match (qubit_migrate.transform.rules.match_rule)
+  2. KB lookup by algorithm family + usage_context
+  3. agility-policy resolve_target()
+  4. No recommendation if asset is not quantum-vulnerable
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Any
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+from qubit_core import row_to_asset
+from sqlalchemy.orm import Session
+
+from ..auth import get_current_tenant
+from ..deps import get_session
+from ..services import require_asset
+
+router = APIRouter(tags=["recommendation"])
+
+
+class AssetRecommendation(BaseModel):
+    """Read model: per-asset PQC recommendation (E1, doc 08 §2)."""
+
+    asset_id: UUID
+    current: dict[str, Any]
+    target: dict[str, Any]
+    library: dict[str, Any]
+    rationale: str
+    source: str  # "rule" | "kb" | "agility-policy"
+    confidence: float
+
+
+def _family_from_algorithm(algorithm: str) -> str:
+    """Extract the algorithm family from a canonical name like 'RSA-2048' → 'RSA'."""
+    return algorithm.split("-")[0].upper() if algorithm else "UNKNOWN"
+
+
+@router.get("/assets/{asset_id}/recommendation", response_model=AssetRecommendation)
+def get_asset_recommendation(
+    asset_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+    tenant_id: Annotated[UUID, Depends(get_current_tenant)],
+) -> AssetRecommendation:
+    """Return the PQC migration recommendation for a single cryptographic asset (E1).
+
+    The recommendation is assembled from (in priority order):
+    1. A matching migration rule (`source="rule"`).
+    2. The migration knowledge base (`source="kb"`).
+    3. The agility policy defaults/overrides (`source="agility-policy"`).
+
+    Returns 404 if the asset is not found or not quantum-vulnerable (no action needed).
+    """
+    row = require_asset(session, asset_id, tenant_id)
+    asset = row_to_asset(row)
+
+    # Not vulnerable → no recommendation needed
+    if not asset.quantum_vulnerable.vulnerable:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Asset is not quantum-vulnerable; no recommendation applies.",
+        )
+
+    current = {
+        "algorithm": asset.algorithm,
+        "key_size": asset.key_size,
+        "usage_context": asset.usage_context.value,
+        "quantum_vulnerable": asset.quantum_vulnerable.vulnerable,
+        "attack": asset.quantum_vulnerable.attack.value,
+    }
+    family = _family_from_algorithm(asset.algorithm)
+    uc = asset.usage_context.value
+
+    # Cascade: rule → KB → agility policy. Each tier returns only on a match and otherwise falls
+    # through to the next; a genuine error inside a tier (import failure, bug) is NOT swallowed —
+    # it surfaces as a 500 rather than silently degrading to a lower-confidence recommendation.
+    from qubit_migrate.agility import resolve_target
+    from qubit_migrate.kb import lookup_kb
+    from qubit_migrate.regimes import is_hybrid
+    from qubit_migrate.transform.rules import load_rules, match_rule
+
+    # --- 1. Migration rule (highest confidence — a hand-authored, tested transform) ---
+    rule = match_rule(asset, load_rules())
+    if rule is not None:
+        tgt = rule.target
+        lib = tgt.get("library") or {}
+        lib_name = lib.get("name", "") if isinstance(lib, dict) else str(lib)
+        lib_ver = lib.get("min_version", "") if isinstance(lib, dict) else ""
+        pqc = tgt.get("pqc_target") or tgt.get("algorithm", "")
+        group = tgt.get("hybrid_group") or None
+        # The rule DECLARES its construction. Read it.
+        #
+        # This used to be `"hybrid" if "hybrid" in pqc.lower() else "pure"` — a substring search
+        # for the word "hybrid" in the target's NAME. No hybrid is named that way:
+        # `X25519MLKEM768` is the industry-standard hybrid and contains no such word, so 11 of the
+        # 24 rules — including every key-exchange rule, the harvest-now-decrypt-later case — were
+        # reported to the operator as `pure` while carrying `mode: hybrid` two keys away and a
+        # rationale that reads "Migrate to a HYBRID construction". The response contradicted
+        # itself.
+        #
+        # It also inverted the compliance answer, which is the part that does damage: a pure
+        # ML-KEM-768 is an ANSSI certified-track violation and a BSI advisory, while
+        # X25519MLKEM768 satisfies both.
+        #
+        # `is_hybrid` is the fallback rather than the primary because a rule that states its mode
+        # is authoritative about it; the structural check is for rules that omit it.
+        mode = tgt.get("mode") or ("hybrid" if is_hybrid(pqc, group, None) else "pure")
+        return AssetRecommendation(
+            asset_id=asset.id,
+            current=current,
+            # `hybrid_group` is carried through: "hybrid" alone does not tell an operator WHICH
+            # hybrid, and the regimes differ on exactly that — X25519MLKEM768 is approved by BSI
+            # and ANSSI and below grade for CNSA 2.0 and ASD.
+            target={
+                "algorithm": pqc,
+                "mode": mode,
+                "parameter_set": pqc,
+                **({"hybrid_group": group} if group else {}),
+            },
+            library={"name": lib_name, "min_version": lib_ver},
+            rationale=rule.semantic_note or f"Apply {rule.title}",
+            source="rule",
+            confidence=1.0,
+        )
+
+    # --- 2. Migration KB (family + usage_context lookup) ---
+    kb_entry = lookup_kb(family, uc)
+    if kb_entry is not None:
+        py_lib = kb_entry.library.python
+        return AssetRecommendation(
+            asset_id=asset.id,
+            current=current,
+            target=kb_entry.target.model_dump(),
+            library={
+                "name": py_lib.name if py_lib else "",
+                "min_version": py_lib.min_version if py_lib else "",
+            },
+            rationale=kb_entry.guidance,
+            source="kb",
+            confidence=0.9,
+        )
+
+    # --- 3. Agility policy defaults/overrides (lowest confidence fallback) ---
+    policy_target = resolve_target(asset)
+    if policy_target is not None:
+        return AssetRecommendation(
+            asset_id=asset.id,
+            current=current,
+            target=policy_target.model_dump(),
+            library={},
+            rationale=policy_target.rationale or "Derived from crypto agility policy defaults.",
+            source="agility-policy",
+            confidence=0.7,
+        )
+
+    # No tier produced a recommendation.
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"No recommendation available for algorithm '{asset.algorithm}' in context '{uc}'.",
+    )
+
+
+__all__ = ["AssetRecommendation", "router"]

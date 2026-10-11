@@ -1,0 +1,73 @@
+id: py-weakhash-01
+language: python
+title: "SHA-1/MD5 weak hash → argon2id (passwords) or SHA-256 (generic digests)"
+matches:
+  source_scanner: [code]  # not config/cert/key assets — this codemod edits source
+  # Every OTHER rule in this pack that names a language also constrains the file suffix; this one
+  # did not, so it claimed `code` assets in EVERY language the scanner can read. Once the scanner
+  # grew from 6 languages to 19, that meant a libcst Python codemod was the offered migration for
+  # MD5 in .rb, .php, .cs, .rs, .kt, .swift, .scala, .dart, .sh, .ps1 and .sql files — 34 of the
+  # 127 tasks in the polyglot demo project. Matching nothing is the correct answer for those: the
+  # app then says "no codemod rule" instead of offering a patch it cannot produce.
+  file_suffix: [".py"]
+  algorithm: ["MD5", "SHA-1"]
+  # canonical qubit-core UsageContext values (frozen schema): "hash" covers generic
+  # digests/MACs, "password" the credential-hashing path.
+  usage_context: ["hash", "password", "unknown"]
+  library_name: ["hashlib", "cryptography", null]
+target:
+  algorithm: SHA-256          # generic digest path
+  pqc_target: argon2id         # password-hash path
+  library:
+    name: argon2-cffi
+    min_version: "23.1.0"
+data_compat: dual_read
+# This note is fed verbatim to the LLM, so it leads with the BRANCH, not with one of the two
+# outcomes. It previously opened with "For password hashing, use argon2-cffi... Never use hashlib
+# for storing passwords", which framed the password path as the default and led qwen2.5-coder to
+# emit a stray `import argon2` even when it correctly migrated a generic digest to SHA-256.
+semantic_note: >
+  This rule has TWO mutually exclusive paths; pick the one matching the
+  asset's usage_context. (1) Generic digests — checksums, cache keys, ETags,
+  non-secret integrity — upgrade to hashlib.sha256(). This is the default when
+  the context is unclear, because a digest must stay deterministic and
+  comparable. (2) Credential hashing — the code stores or verifies a password
+  — use argon2-cffi (argon2id) via argon2.PasswordHasher; never use a plain
+  hashlib digest for credentials. Do not mix the two: argon2id output is
+  salted and non-deterministic, so substituting it for a digest breaks any
+  byte-wise comparison. The dual_read flag means existing hashed values can
+  still be verified (argon2id records parameters in the hash string; SHA-256
+  digests are compared byte-by-byte) — no immediate re-hash of stored data is
+  required, but rehash on next login is recommended.
+codemod: weakhash_to_argon2_or_sha256
+prompt_constraints:
+  - "Choose exactly ONE path; never emit both argon2 and a sha256 replacement."
+  - "Generic digest path: use hashlib.sha256 and do NOT import argon2 at all."
+  - "Credential path (code stores/verifies a password): use argon2.PasswordHasher."
+  - "Do NOT import the old hashlib.md5 or hashlib.sha1 in the new code."
+  - "Preserve surrounding function signatures."
+example:
+  before: |
+    import hashlib
+    def store_password(pw: str) -> str:
+        return hashlib.sha1(pw.encode()).hexdigest()
+  after: |
+    from argon2 import PasswordHasher
+    _ph = PasswordHasher()
+    def store_password(pw: str) -> str:
+        return _ph.hash(pw)
+# Second worked example for the OTHER path. The rule offers two outcomes but only demonstrated the
+# credential one, so nothing showed what a correct generic-digest migration looks like — note that
+# argon2 is absent entirely here, which is the point.
+example_generic_digest:
+  before: |
+    import hashlib
+    def file_checksum(data: bytes) -> str:
+        return hashlib.md5(data).hexdigest()
+  after: |
+    import hashlib
+    def file_checksum(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+rescan_expect:
+  gone:
+    algorithm_prefix: ["MD5", "SHA-1"]

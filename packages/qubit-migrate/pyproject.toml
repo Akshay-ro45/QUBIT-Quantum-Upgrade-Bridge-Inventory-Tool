@@ -1,0 +1,28 @@
+[project]
+name = "qubit-migrate"
+version = "0.1.0"
+description = "QUBIT migrate (placeholder — see docs/design)"
+requires-python = ">=3.12,<3.14"
+license = "MIT"
+dependencies = [
+    "qubit-core",
+    "platformdirs>=4.2",  # llm.py resolves the rate-budget cache file beside the DB with this
+    "networkx>=3.3",
+    "libcst>=1.4",
+    "tree-sitter>=0.24,<0.26",  # 0.26.0 binding SIGSEGVs during scanning; see qubit-scanner pin
+    "tree-sitter-language-pack>=1.12",
+    "GitPython>=3.1.43",
+    "PyYAML>=6.0.1",
+    "typer>=0.12",
+    "rich>=13.7",
+    "unidiff>=0.7.5",
+    "pydantic-settings>=2.0",
+]
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qubit_migrate"]

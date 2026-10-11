@@ -1,0 +1,126 @@
+"""TLS handshake probing using openssl s_client."""
+
+import logging
+import os
+import re
+import subprocess
+from datetime import UTC, datetime
+
+from qubit_bridge.models import ProbeResult
+from qubit_bridge.registry import codepoint, is_hybrid
+
+logger = logging.getLogger(__name__)
+
+# The probe runs `openssl s_client` inside a container that already ships OpenSSL 3.5.x with the
+# CLI (host OpenSSL may be older / lack X25519MLKEM768). We do NOT `apk add` at probe time — that
+# needs network on every call (breaking the offline requirement) and its ~25 s install blew the
+# probe timeout, making every probe return unreachable. The default image is the hybrid-bridge
+# image the project already builds (openssl CLI present); override with QUBIT_PROBER_IMAGE.
+DEFAULT_PROBER_IMAGE = "qubit-nginx-hybrid:latest"
+
+
+def _prober_image() -> str:
+    return os.environ.get("QUBIT_PROBER_IMAGE", DEFAULT_PROBER_IMAGE)
+
+
+def probe_host(
+    host: str,
+    port: int = 443,
+    *,
+    groups: str | None = None,
+    sni: str | None = None,
+    timeout: float = 15.0,
+    image: str | None = None,
+) -> ProbeResult:
+    """Probe the target using openssl s_client to extract TLS handshake facts.
+
+    ``image`` (or ``$QUBIT_PROBER_IMAGE``) selects the container that runs openssl; it must already
+    have the openssl CLI (OpenSSL 3.5+ for X25519MLKEM768). No package is installed at probe time.
+    """
+    server_name = sni or host
+    groups_arg = f"-groups {groups}" if groups else ""
+
+    # In Docker Desktop, localhost inside the container resolves to the container itself.
+    docker_host = "host.docker.internal" if host in ("localhost", "127.0.0.1") else host
+
+    shell_cmd = (
+        f"openssl s_client -connect {docker_host}:{port} -tls1_3 -brief "
+        f"-servername {server_name} {groups_arg}"
+    ).strip()
+
+    prober_image = image or _prober_image()
+    cmd = ["docker", "run", "--rm", "--entrypoint", "", prober_image, "/bin/sh", "-c", shell_cmd]
+
+    probed_at = datetime.now(UTC)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=b"",  # Empty stdin closes connection immediately after handshake
+            capture_output=True,
+            timeout=timeout,
+            text=True,
+        )
+        raw_output = proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired as e:
+        return ProbeResult(
+            host=host,
+            port=port,
+            reachable=False,
+            error=f"Timeout ({timeout}s)",
+            raw_output=e.stdout.decode() if e.stdout else "",
+            probed_at=probed_at,
+        )
+    except Exception as e:
+        return ProbeResult(
+            host=host, port=port, reachable=False, error=str(e), raw_output="", probed_at=probed_at
+        )
+
+    if proc.returncode != 0 and "CONNECTION ESTABLISHED" not in raw_output:
+        # May "fail" yet still print CONNECTION ESTABLISHED (stdin close + server reset);
+        # if we don't see it, treat as unreachable.
+        return ProbeResult(
+            host=host,
+            port=port,
+            reachable=False,
+            error=f"Connection failed (exit {proc.returncode})",
+            raw_output=raw_output,
+            probed_at=probed_at,
+        )
+
+    result = ProbeResult(
+        host=host, port=port, reachable=True, raw_output=raw_output, probed_at=probed_at
+    )
+
+    # Parse output
+    # Protocol version: TLSv1.3 or Protocol  : TLSv1.3 or New, TLSv1.3
+    m_tls = re.search(r"Protocol(?: version)?\s*:\s*(TLS[^\n]+)", raw_output)
+    if not m_tls:
+        m_tls = re.search(r"New,\s*(TLS[^,]+)", raw_output)
+    if m_tls:
+        result.tls_version = m_tls.group(1).strip()
+
+    # Negotiated TLS1.3 group: X25519MLKEM768
+    m_group = re.search(r"Negotiated TLS1\.3 group:\s*(\S+)", raw_output)
+    if not m_group:
+        m_group = re.search(r"Server Temp Key:\s*(\S+)", raw_output)
+    if m_group:
+        result.negotiated_group = m_group.group(1).strip()
+
+    # Ciphersuite: TLS_AES_256_GCM_SHA384
+    m_cipher = re.search(r"Ciphersuite:\s*(\S+)", raw_output)
+    if not m_cipher:
+        m_cipher = re.search(r"Cipher\s*:\s*(\S+)", raw_output)
+    if m_cipher:
+        result.cipher_suite = m_cipher.group(1).strip()
+
+    # Peer signature type: RSA-PSS
+    m_sig = re.search(r"Peer signature type:\s*(.+)", raw_output)
+    if m_sig:
+        result.peer_signature_type = m_sig.group(1).strip()
+
+    # Resolve registry mappings
+    result.group_codepoint = codepoint(result.negotiated_group)
+    result.hybrid_pqc = is_hybrid(result.negotiated_group)
+
+    return result

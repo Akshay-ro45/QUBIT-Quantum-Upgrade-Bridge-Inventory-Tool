@@ -1,0 +1,154 @@
+schema: qubit-rule/v1
+language: javascript
+library:
+  name: jsonwebtoken
+  # Left empty deliberately: resolve.py has no import-extraction query for javascript/typescript
+  # yet (only python/java/go are wired up), so a non-empty detect_imports here would gate this
+  # rule off unconditionally (_import_gate requires a member of detect_imports to appear in an
+  # always-empty imports set). Running the query unconditionally is correct until JS/TS import
+  # extraction lands.
+  detect_imports: []
+rules:
+  # Found by benchmarks/recall against an independent detector on go-jose, where JWA identifiers
+  # were 17 of the 23 remaining file-level misses. The rules below this one match a single call
+  # shape from a single library, so every other way a codebase names a token algorithm -- a list of
+  # accepted algorithms, a JOSE header dict, a comparison against a constant -- was invisible.
+  # Identifiers per the IANA JOSE registry (RFC 7518 §3.1, §4.1, §5.1); `dir` and `none` are
+  # excluded as too generic to be evidence.
+  - id: JS-JWA-WIRE-NAME
+    title: JWA algorithm identifier in a string ("RS256", "RSA-OAEP", "A128CBC-HS256")
+    match:
+      query: |
+        (string (string_fragment) @alg) @call
+      where:
+        - capture: alg
+          regex: "^(RS256|RS384|RS512|PS256|PS384|PS512|ES256K|ES256|ES384|ES512|EdDSA|HS256|HS384|HS512|RSA1_5|RSA-OAEP-256|RSA-OAEP|ECDH-ES\\+A128KW|ECDH-ES\\+A192KW|ECDH-ES\\+A256KW|ECDH-ES|A128KW|A192KW|A256KW|A128GCMKW|A192GCMKW|A256GCMKW|A128GCM|A192GCM|A256GCM|A128CBC-HS256|A192CBC-HS384|A256CBC-HS512|PBES2-HS256\\+A128KW|PBES2-HS384\\+A192KW|PBES2-HS512\\+A256KW)$"
+    extract:
+      algorithm: { from: alg, resolve: jwa-identifier }
+    asset: { asset_type: algorithm-use, usage_context: token }
+    confidence: medium
+    dedupe: per-file
+    examples:
+      positive:
+        - |
+          const allowed = ['RS256', 'ES256'];
+        - |
+          const h = { alg: 'RSA-OAEP' };
+      negative:
+        - |
+          const name = 'some other string';
+
+  - id: JS-JWT-RS256
+    title: "jsonwebtoken RS256 token signing (jwt.sign(payload, key, { algorithm: 'RS256' }))"
+    match:
+      query: |
+        (call_expression
+          function: (member_expression
+            object: (identifier) @obj
+            property: (property_identifier) @meth)
+          arguments: (arguments
+            (object
+              (pair
+                key: (property_identifier) @key
+                value: (string (string_fragment) @alg))))) @call
+      where:
+        - { capture: obj, equals: jwt }
+        - { capture: meth, equals: sign }
+        - { capture: key, equals: algorithm }
+        - { capture: alg, equals: RS256 }
+    extract:
+      algorithm: { literal: RS256 }
+    asset: { asset_type: algorithm-use, usage_context: token }
+    confidence: high
+    examples:
+      positive:
+        - |
+          const jwt = require('jsonwebtoken');
+          function f() {
+            const token = jwt.sign(payload, privateKey, { algorithm: 'RS256' });
+            return token;
+          }
+      negative:
+        - |
+          const jwt = require('jsonwebtoken');
+          function f() {
+            const token = jwt.sign(payload, secret, { algorithm: 'HS256' });
+            return token;
+          }
+
+  - id: JS-JWT-ES256
+    title: "jsonwebtoken ES256 token signing (jwt.sign(payload, key, { algorithm: 'ES256' }))"
+    match:
+      query: |
+        (call_expression
+          function: (member_expression
+            object: (identifier) @obj
+            property: (property_identifier) @meth)
+          arguments: (arguments
+            (object
+              (pair
+                key: (property_identifier) @key
+                value: (string (string_fragment) @alg))))) @call
+      where:
+        - { capture: obj, equals: jwt }
+        - { capture: meth, equals: sign }
+        - { capture: key, equals: algorithm }
+        - { capture: alg, equals: ES256 }
+    extract:
+      algorithm: { literal: ES256 }
+    asset: { asset_type: algorithm-use, usage_context: token }
+    confidence: high
+    examples:
+      positive:
+        - |
+          const jwt = require('jsonwebtoken');
+          function f() {
+            const token = jwt.sign(payload, ecPrivateKey, { algorithm: 'ES256' });
+            return token;
+          }
+      negative:
+        - |
+          const jwt = require('jsonwebtoken');
+          function f() {
+            const token = jwt.sign(payload, secret, { algorithm: 'HS256' });
+            return token;
+          }
+
+  # JWT signature verification bypassed: `algorithms: ['none']`, or `jwt.decode` used where
+  # `jwt.verify` was meant. Both are the classic JWT authentication bypass (CWE-347) - the claims
+  # are read and trusted without the signature being checked.
+  #
+  # `jwt.decode` is flagged deliberately: in `jsonwebtoken` it does NOT verify, and using its
+  # result for an authorization decision is the single most common way this goes wrong.
+  - id: JS-JWT-VERIFICATION-DISABLED
+    title: jwt.decode / algorithms none
+    match:
+      query: |
+        (call_expression
+          function: (member_expression
+            object: (identifier) @obj
+            property: (property_identifier) @meth)) @call
+      where:
+        - { capture: obj, in: [jwt, jsonwebtoken] }
+        - { capture: meth, in: [decode, verify] }
+        - capture: call
+          regex: '["'']none["'']|\.decode\('
+    extract:
+      algorithm: { literal: UNRESOLVED }
+      jwt_verification:
+        from: call
+        resolve: jwt-verification
+    asset: { asset_type: algorithm-use, usage_context: token }
+    confidence: high
+    examples:
+      positive:
+        - |
+          const jwt = require("jsonwebtoken");
+          const claims = jwt.decode(token);
+        - |
+          const jwt = require("jsonwebtoken");
+          const claims = jwt.verify(token, key, { algorithms: ["none"] });
+      negative:
+        - |
+          const jwt = require("jsonwebtoken");
+          const claims = jwt.verify(token, key, { algorithms: ["RS256"] });

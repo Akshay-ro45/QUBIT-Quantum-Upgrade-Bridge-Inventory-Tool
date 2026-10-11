@@ -1,0 +1,26 @@
+[project]
+name = "qubit-api"
+version = "0.1.0"
+description = "QUBIT FastAPI service and persistence layer"
+requires-python = ">=3.12,<3.14"
+license = "MIT"
+dependencies = [
+  "fastapi>=0.139",
+  "pydantic-settings>=2.6",
+  "qubit-core",
+  "qubit-migrate",
+  "qubit-risk",
+  "qubit-scanner",
+  "sse-starlette~=3.4",
+  "uvicorn>=0.35",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qubit_api"]
+
+[tool.uv.sources]
+qubit-risk = { workspace = true }
